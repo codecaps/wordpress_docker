@@ -1,0 +1,1 @@
+docker push eu.gcr.io/appstrax/wordpress:6.5
