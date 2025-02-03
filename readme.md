@@ -4,10 +4,10 @@ This repository is used for Code Capsules wordpress deployments.
 <br>
 
 All wordpress deployment must use FPM images (FPM is PHP's fastcgi implementation)
-<br>`default.conf` and `nginx.conf` are used as the nginx config on all wordpress deployments.
 
-<br>`run.sh` is the file which is by docker on image start.
-<br>this file will: 
+We use nginx as a proxy. `default.conf` and `nginx.conf` are used as the nginx config.
+
+`run.sh` is the file which docker rus on image start, this file will: 
 <br>- copy the custom php.ini values from `$WP_CUSTOM_INI` to the `$PHP_INI_DIR/conf.d/` directory
 <br>- start the nginx service
 <br>- run the wordpress php-fpm start command
