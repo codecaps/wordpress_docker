@@ -2,7 +2,7 @@
 
 if [ "$WP_CUSTOM_INI" ]; then
     echo "Writing custom ini values"
-    echo -e $WP_CUSTOM_INI > $PHP_INI_DIR/conf.d/custom.ini
+    printf "$WP_CUSTOM_INI" > $PHP_INI_DIR/conf.d/custom.ini
 fi
 
 service nginx start 
