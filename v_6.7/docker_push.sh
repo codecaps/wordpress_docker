@@ -1,1 +1,1 @@
-docker push eu.gcr.io/appstrax/wordpress:6.7
+docker push europe-west4-docker.pkg.dev/appstrax/main/wordpress:6.7

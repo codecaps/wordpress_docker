@@ -10,4 +10,4 @@ docker run \
 --name wordpress \
 -v wordpress:/var/www/html \
 -e WP_CUSTOM_INI='upload_max_filesize = 64M\npost_max_size = 64M\nmax_execution_time = 300' \
--d eu.gcr.io/appstrax/wordpress:6.6
+-d europe-west4-docker.pkg.dev/appstrax/main/wordpress:6.6

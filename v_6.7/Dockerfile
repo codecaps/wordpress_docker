@@ -1,4 +1,4 @@
-FROM wordpress:6.7.1-php8.3-fpm
+FROM wordpress:6.7.2-php8.3-fpm
 
 RUN apt update
 RUN apt install -y nginx

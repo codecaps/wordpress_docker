@@ -1,1 +1,1 @@
-docker buildx build . --platform linux/amd64 --progress=auto -t eu.gcr.io/appstrax/wordpress:6.7
+docker buildx build . --platform linux/amd64 --progress=auto -t europe-west4-docker.pkg.dev/appstrax/main/wordpress:6.7
