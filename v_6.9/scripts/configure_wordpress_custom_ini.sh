@@ -5,7 +5,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./lib/merge_and_write_config.sh
 source "$SCRIPT_DIR/lib/merge_and_write_config.sh"
 
-DEFAULT_WORDPRESS_CUSTOM_INI='; Security / information leakage
+# MAX_UPLOAD_SIZE drives the default for upload_max_filesize and post_max_size so
+# they stay in sync with the nginx client_max_body_size set by configure_nginx_overrides.sh.
+# Customers can still override via WORDPRESS_CUSTOM_INI.
+_upload_size="${MAX_UPLOAD_SIZE:-64M}"
+
+# SESSION_COOKIE_SECURE: set to 0 for local HTTP development, 1 for production HTTPS.
+_session_secure="${SESSION_COOKIE_SECURE:-1}"
+if [[ "$_session_secure" != "0" && "$_session_secure" != "1" ]]; then
+    echo "[custom-ini] Invalid SESSION_COOKIE_SECURE value '${_session_secure}'. Falling back to 1."
+    _session_secure="1"
+fi
+
+DEFAULT_WORDPRESS_CUSTOM_INI="; Security / information leakage
 expose_php = Off
 cgi.fix_pathinfo = 0
 
@@ -15,9 +27,9 @@ max_execution_time = 60
 max_input_time = 60
 max_input_vars = 3000
 
-; Uploads
-upload_max_filesize = 64M
-post_max_size = 64M
+; Uploads — kept in sync with nginx MAX_UPLOAD_SIZE
+upload_max_filesize = ${_upload_size}
+post_max_size = ${_upload_size}
 file_uploads = On
 
 ; Error handling
@@ -30,10 +42,7 @@ error_reporting = E_ALL & ~E_DEPRECATED & ~E_STRICT
 ; Sessions
 session.cookie_httponly = 1
 session.cookie_samesite = Lax
-
-; If your site is HTTPS-only behind Traefik, this is a good default.
-; If you still test over plain HTTP, comment it out.
-session.cookie_secure = 1
+session.cookie_secure = ${_session_secure}
 
 ; Realpath cache helps WordPress/plugin file lookups.
 realpath_cache_size = 4096K
@@ -64,7 +73,7 @@ allow_url_include = Off
 
 ; Optional: uncomment only after testing plugin compatibility.
 ; disable_functions = exec,passthru,shell_exec,system,proc_open,popen,curl_multi_exec,parse_ini_file,show_source
-'
+"
 
 merge_and_write_config \
     "$DEFAULT_WORDPRESS_CUSTOM_INI" \

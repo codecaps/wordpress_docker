@@ -1,0 +1,8 @@
+.git
+.gitignore
+*.md
+specs
+docker_build_and_run.sh
+.env
+.env.*
+*.log
