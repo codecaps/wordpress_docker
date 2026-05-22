@@ -9,6 +9,9 @@ NGINX_SECURITY_HEADERS_FILE="/etc/nginx/conf.d/generated_security_headers.conf"
 NGINX_DEBUG_HEADERS_FILE="/etc/nginx/conf.d/generated_debug_headers.conf"
 NGINX_WP_CRON_FILE="/etc/nginx/conf.d/generated_wp_cron.conf"
 NGINX_EXTRA_FILE="/etc/nginx/conf.d/generated_extra.conf"
+NGINX_CACHE_KEY_FILE="/etc/nginx/conf.d/generated_cache_key.conf"
+
+CACHE_IGNORE_STRIP_LAYERS=16
 
 DEFAULT_RATE_LIMIT_NORMAL_ROUTES_RPM="120"
 DEFAULT_RATE_LIMIT_PROTECTED_ROUTES_RPM="30"
@@ -59,6 +62,155 @@ validated_upload_size() {
     echo "$fallback"
 }
 
+pattern_to_name_regex() {
+    local pattern="$1"
+    local result=""
+    local i char
+
+    for (( i=0; i<${#pattern}; i++ )); do
+        char="${pattern:$i:1}"
+        case "$char" in
+            '*') result+='[^&=]*' ;;
+            '.') result+='\\.' ;;
+            '+') result+='\\+' ;;
+            '?') result+='\\?' ;;
+            '^') result+='\\^' ;;
+            '$') result+='\\$' ;;
+            '(') result+='\\(' ;;
+            ')') result+='\\)' ;;
+            '[') result+='\\[' ;;
+            ']') result+='\\]' ;;
+            '{') result+='\\{' ;;
+            '}') result+='\\}' ;;
+            '|') result+='\\|' ;;
+            '\\') result+='\\\\' ;;
+            *) result+="$char" ;;
+        esac
+    done
+
+    echo "$result"
+}
+
+parse_cache_ignore_patterns() {
+    local json="${CACHE_IGNORE_QUERY_PARAMS:-}"
+
+    if [ -z "$json" ]; then
+        return 1
+    fi
+
+    CACHE_IGNORE_PATTERNS_JSON="$json" php -r '
+        $raw = getenv("CACHE_IGNORE_PATTERNS_JSON") ?: "[]";
+        $decoded = json_decode($raw, true);
+        if (!is_array($decoded) || json_last_error() !== JSON_ERROR_NONE) {
+            fwrite(STDERR, "invalid json\n");
+            exit(2);
+        }
+        foreach ($decoded as $item) {
+            if (!is_string($item) || $item === "") {
+                exit(3);
+            }
+            if (!preg_match("/^[A-Za-z0-9_*-]+$/", $item)) {
+                exit(4);
+            }
+            echo $item, "\n";
+        }
+    '
+}
+
+build_cache_ignore_name_regex() {
+    local patterns=()
+    local pattern regex combined=""
+
+    cache_ignore_name_regex=""
+    cache_ignore_patterns_log=""
+
+    patterns_raw="$(parse_cache_ignore_patterns)"
+    local parse_rc=$?
+    if [ "$parse_rc" -ne 0 ]; then
+        return "$parse_rc"
+    fi
+
+    while IFS= read -r pattern; do
+        [ -n "$pattern" ] || continue
+        patterns+=("$pattern")
+    done <<< "$patterns_raw"
+
+    if [ "${#patterns[@]}" -eq 0 ]; then
+        return 5
+    fi
+
+    for pattern in "${patterns[@]}"; do
+        regex="$(pattern_to_name_regex "$pattern")"
+        if [ -n "$combined" ]; then
+            combined+="|"
+        fi
+        combined+="$regex"
+    done
+
+    cache_ignore_patterns_log="$(IFS=,; echo "${patterns[*]}")"
+    cache_ignore_name_regex="(?:${combined})"
+}
+
+write_default_cache_key() {
+    cat > "$NGINX_CACHE_KEY_FILE" <<'EOF'
+# Auto-generated at container startup. Do not edit manually.
+fastcgi_cache_key "$http_x_forwarded_proto|$request_method|$host|$request_uri";
+EOF
+}
+
+write_normalized_cache_key() {
+    local name_regex="$1"
+    local layer from_var to_var
+
+    {
+        echo "# Auto-generated at container startup. Do not edit manually."
+        echo "# Cache key ignores query params matching: ${cache_ignore_patterns_log}"
+        echo ""
+        echo "map \$request_uri \$cache_uri_path {"
+        echo "    default \$request_uri;"
+        echo "    ~^([^?]+) \$1;"
+        echo "}"
+        echo ""
+        echo "map \$args \$cache_args_0 {"
+        echo "    default \$args;"
+        echo '    "" "";'
+        echo "}"
+        echo ""
+
+        from_var="cache_args_0"
+        for (( layer=0; layer<CACHE_IGNORE_STRIP_LAYERS; layer++ )); do
+            to_var="cache_args_$((layer + 1))"
+            cat <<EOF
+map \$${from_var} \$${to_var} {
+    default \$${from_var};
+    ~^(.*)&${name_regex}=[^&]*&(.*)$ \$1&\$2;
+    ~^(.*)&${name_regex}=[^&]*$ \$1;
+    ~^${name_regex}=[^&]*&(.*)$ \$1;
+    ~^${name_regex}=[^&]*$ "";
+}
+
+EOF
+            from_var="$to_var"
+        done
+
+        cat <<EOF
+map \$${from_var} \$cache_args {
+    default \$${from_var};
+    ~^&(.*)$ \$1;
+    ~^(.*)&$ \$1;
+    ~^&+$ "";
+}
+
+map \$cache_args \$cache_key_suffix {
+    default "?\$cache_args";
+    "" "";
+}
+
+fastcgi_cache_key "\$http_x_forwarded_proto|\$request_method|\$host|\$cache_uri_path\$cache_key_suffix";
+EOF
+    } > "$NGINX_CACHE_KEY_FILE"
+}
+
 # --- Parse env vars ---
 
 xmlrpc_enabled_raw="${XMLRPC_ENABLED:-$DEFAULT_XMLRPC_ENABLED}"
@@ -84,6 +236,25 @@ if [ -n "${CACHE_TTL_SECONDS:-}" ]; then
         cache_ttl_seconds="$CACHE_TTL_SECONDS"
     else
         log "Invalid CACHE_TTL_SECONDS value '${CACHE_TTL_SECONDS}'. Must be a positive integer."
+        exit 1
+    fi
+fi
+
+# --- Cache ignore query params (requires cache enabled) ---
+
+cache_ignore_query_params_enabled="false"
+cache_ignore_patterns_log=""
+
+if [ "$cache_enabled" = "true" ] && [ -n "${CACHE_IGNORE_QUERY_PARAMS:-}" ]; then
+    parse_status=0
+    build_cache_ignore_name_regex || parse_status=$?
+
+    if [ "$parse_status" -eq 0 ] && [ -n "$cache_ignore_name_regex" ]; then
+        cache_ignore_query_params_enabled="true"
+    elif [ "$parse_status" -eq 5 ]; then
+        log "CACHE_IGNORE_QUERY_PARAMS is empty or []. Using default cache key."
+    else
+        log "Invalid CACHE_IGNORE_QUERY_PARAMS value '${CACHE_IGNORE_QUERY_PARAMS}'. Must be a JSON array of non-empty strings (allowed: A-Za-z0-9_*-)."
         exit 1
     fi
 fi
@@ -128,6 +299,13 @@ else
 fastcgi_cache_bypass 1;
 fastcgi_no_cache 1;
 EOF
+fi
+
+# FastCGI cache key (http{} context).
+if [ "$cache_ignore_query_params_enabled" = "true" ]; then
+    write_normalized_cache_key "$cache_ignore_name_regex"
+else
+    write_default_cache_key
 fi
 
 # XML-RPC route (location{} context).
@@ -224,6 +402,7 @@ fi
 
 log "Generated overrides:"
 log "  cache_enabled=${cache_enabled}, cache_ttl_seconds=${cache_ttl_seconds:-unset}"
+log "  cache_ignore_query_params=$([ "$cache_ignore_query_params_enabled" = "true" ] && echo "$cache_ignore_patterns_log" || echo "disabled")"
 log "  xmlrpc_enabled=${xmlrpc_enabled_raw}, disable_public_wp_cron=${disable_public_wp_cron_raw}"
 log "  max_upload_size=${max_upload_size}, max_conn_per_ip=${max_conn_per_ip}"
 log "  normal_routes_rpm=${normal_routes_rpm}, protected_routes_rpm=${protected_routes_rpm}, api_routes_rpm=${api_routes_rpm}"
