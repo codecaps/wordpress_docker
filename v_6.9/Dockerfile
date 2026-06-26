@@ -16,8 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends nginx curl \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# Copy WordPress files (populated by the Code Capsules build pipeline).
-COPY ./wp-html /var/www/html
+
+
 
 # Copy WordPress application metrics endpoint (served via internal nginx on :8080).
 COPY wp-metrics.php /var/www/html/wp-metrics.php
@@ -25,6 +25,23 @@ COPY wp-metrics.php /var/www/html/wp-metrics.php
 # Copy nginx config.
 COPY nginx.conf /etc/nginx/nginx.conf
 COPY default.conf /etc/nginx/conf.d/default.conf
+
+# Bake Cloudflare edge ranges into the trusted-proxy set so X-Forwarded-For
+# recursion resolves the true client IP when proxied by Cloudflare (see nginx.conf).
+# Prefer the live published lists; fall back to the version-controlled snapshot
+# (with a warning) if the fetch fails, so the image never ships an empty trust set.
+COPY cloudflare_ips.fallback.conf /usr/share/nginx/cloudflare_ips.fallback.conf
+RUN set -eux; \
+    v4="$(curl -fsSL --max-time 10 https://www.cloudflare.com/ips-v4 || true)"; \
+    v6="$(curl -fsSL --max-time 10 https://www.cloudflare.com/ips-v6 || true)"; \
+    if printf '%s' "$v4" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$'; then \
+        { echo '# Fetched from Cloudflare at build time.'; \
+          for ip in $v4 $v6; do echo "set_real_ip_from $ip;"; done; \
+        } > /etc/nginx/conf.d/cloudflare_ips.conf; \
+    else \
+        echo 'WARNING: Cloudflare IP fetch failed/empty at build — using bundled fallback ranges.' >&2; \
+        cp /usr/share/nginx/cloudflare_ips.fallback.conf /etc/nginx/conf.d/cloudflare_ips.conf; \
+    fi
 
 # Copy entrypoint and startup scripts.
 COPY run.sh /usr/run.sh
