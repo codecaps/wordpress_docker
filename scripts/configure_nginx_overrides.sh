@@ -279,6 +279,19 @@ cat > "$NGINX_SERVER_OVERRIDES_FILE" <<EOF
 limit_conn per_ip_conn ${max_conn_per_ip};
 EOF
 
+# Never cache an empty-bodied 200 (e.g. a blank page from a failed whole-page
+# output buffer). Controlled by CACHE_SKIP_EMPTY (default: true); references the
+# $cache_skip_empty map in nginx.conf.
+cache_skip_empty_enabled="true"
+if [[ "${CACHE_SKIP_EMPTY:-true}" =~ ^([Ff]alse|0|[Nn]o|[Oo]ff)$ ]]; then
+    cache_skip_empty_enabled="false"
+fi
+
+cache_no_cache_vars="\$skip_cache \$upstream_http_set_cookie"
+if [ "$cache_skip_empty_enabled" = "true" ]; then
+    cache_no_cache_vars="$cache_no_cache_vars \$cache_skip_empty"
+fi
+
 # FastCGI cache directives (location{} context).
 if [ "$cache_enabled" = "true" ]; then
     cat > "$NGINX_CACHE_OVERRIDES_FILE" <<EOF
@@ -290,7 +303,7 @@ fastcgi_cache_background_update on;
 fastcgi_cache_lock on;
 fastcgi_cache_lock_timeout 10s;
 fastcgi_cache_bypass \$skip_cache;
-fastcgi_no_cache \$skip_cache \$upstream_http_set_cookie;
+fastcgi_no_cache ${cache_no_cache_vars};
 EOF
 else
     cat > "$NGINX_CACHE_OVERRIDES_FILE" <<'EOF'
@@ -346,6 +359,8 @@ location = /wp-cron.php {
     fastcgi_param HTTP_X_FORWARDED_FOR $http_x_forwarded_for;
     fastcgi_param HTTP_X_FORWARDED_PROTO $http_x_forwarded_proto;
     fastcgi_pass php_fpm;
+    fastcgi_read_timeout 120s;
+    fastcgi_send_timeout 120s;
     fastcgi_no_cache 1;
     fastcgi_cache_bypass 1;
 }
@@ -364,6 +379,8 @@ location = /wp-cron.php {
     fastcgi_param HTTP_X_FORWARDED_FOR $http_x_forwarded_for;
     fastcgi_param HTTP_X_FORWARDED_PROTO $http_x_forwarded_proto;
     fastcgi_pass php_fpm;
+    fastcgi_read_timeout 120s;
+    fastcgi_send_timeout 120s;
     fastcgi_no_cache 1;
     fastcgi_cache_bypass 1;
 }
@@ -401,7 +418,7 @@ EOF
 fi
 
 log "Generated overrides:"
-log "  cache_enabled=${cache_enabled}, cache_ttl_seconds=${cache_ttl_seconds:-unset}"
+log "  cache_enabled=${cache_enabled}, cache_ttl_seconds=${cache_ttl_seconds:-unset}, cache_skip_empty=${cache_skip_empty_enabled}"
 log "  cache_ignore_query_params=$([ "$cache_ignore_query_params_enabled" = "true" ] && echo "$cache_ignore_patterns_log" || echo "disabled")"
 log "  xmlrpc_enabled=${xmlrpc_enabled_raw}, disable_public_wp_cron=${disable_public_wp_cron_raw}"
 log "  max_upload_size=${max_upload_size}, max_conn_per_ip=${max_conn_per_ip}"

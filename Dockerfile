@@ -28,8 +28,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends nginx curl \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-
-
+# Install the PhpRedis (PECL) C extension so the Redis object cache uses the fast
+# native client instead of the pure-PHP Predis fallback (every wp_cache_*/transient
+# call is a Redis round-trip, so the per-op cost matters). Build deps ($PHPIZE_DEPS
+# is provided by the upstream php image) are installed and purged in the same layer
+# to keep the image slim. `yes ''` accepts pecl's default prompt answers
+# non-interactively; the final `php -m` check fails the build if the extension
+# didn't load.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends $PHPIZE_DEPS; \
+    yes '' | pecl install redis; \
+    docker-php-ext-enable redis; \
+    apt-get purge -y --auto-remove $PHPIZE_DEPS; \
+    rm -rf /var/lib/apt/lists/*; \
+    php -m | grep -q '^redis$'
 
 # Copy WordPress application metrics endpoint (served via internal nginx on :8080).
 COPY wp-metrics.php /var/www/html/wp-metrics.php
