@@ -39,6 +39,11 @@ Images go to `europe-west4-docker.pkg.dev/appstrax/main/wordpress-runtime`:
    (`docker buildx imagetools inspect wordpress:php8.4-fpm --format '{{json .Manifest.Digest}}'`)
    and `REVISION` in `tracks/php<minor>.env`. Raise `MIN_PHP_VERSION` when a security fix makes
    older PHP unacceptable.
+
+   Renovate (`renovate.json`) opens these digest PRs every Monday morning, one per track. It does
+   not touch `REVISION`: **the PR author must bump `REVISION` in the same PR** — the `runtime`
+   workflow fails a `BASE_IMAGE` change without one, and builds + smoke-tests every track (it
+   never pushes).
 2. Build: `./build.sh 8.4` (prints the immutable ref).
 3. Smoke: `tests/smoke.sh <ref> <MIN_PHP_VERSION>` — every check must `PASS`.
 4. Push: `./push.sh 8.4` (immutable tag, then the moving alias).
