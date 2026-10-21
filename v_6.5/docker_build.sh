@@ -1,1 +1,2 @@
-docker buildx build . --platform linux/amd64 --progress=auto -t europe-west4-docker.pkg.dev/appstrax/main/wordpress:6.5
+#!/usr/bin/env bash
+exec "$(dirname "$0")/../docker_build.sh" 6.5 "$@"

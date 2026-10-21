@@ -1,1 +1,2 @@
-docker push europe-west4-docker.pkg.dev/appstrax/main/wordpress:6.6
+#!/usr/bin/env bash
+exec "$(dirname "$0")/../docker_push.sh" 6.6 "$@"
