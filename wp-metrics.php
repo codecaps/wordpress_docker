@@ -4,7 +4,7 @@
 // SHORTINIT loads WP core only — no plugins/themes — fast and safe.
 
 define('SHORTINIT', true);
-require dirname(__FILE__) . '/wp-load.php';
+require '/var/www/html/wp-load.php';
 
 global $wpdb;
 

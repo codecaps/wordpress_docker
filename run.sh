@@ -9,15 +9,17 @@ RUN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 nginx -t
 
+# Stops every child, then exits with $1 (default 0: a TERM/INT-initiated shutdown is clean).
 _shutdown() {
-    echo "[run] Signal received — shutting down"
+    local status="${1:-0}"
+    echo "[run] Shutting down (exit ${status})"
     [ -n "${NGINX_PID:-}"      ] && kill -TERM "$NGINX_PID"      2>/dev/null || true
     [ -n "${NGINX_EXP_PID:-}"  ] && kill -TERM "$NGINX_EXP_PID"  2>/dev/null || true
     [ -n "${FPM_EXP_PID:-}"    ] && kill -TERM "$FPM_EXP_PID"    2>/dev/null || true
     [ -n "${CRON_LOOP_PID:-}"  ] && kill -TERM "$CRON_LOOP_PID"  2>/dev/null || true
     [ -n "${FPM_PID:-}"        ] && kill -TERM "$FPM_PID"        2>/dev/null || true
     wait 2>/dev/null || true
-    exit 0
+    exit "$status"
 }
 trap _shutdown TERM INT
 
@@ -133,6 +135,10 @@ if [[ "${wp_cron_trigger_enabled,,}" =~ ^(true|1|yes|on)$ ]]; then
     CRON_LOOP_PID=$!
 fi
 
-# Exit as soon as nginx or php-fpm dies — triggers _shutdown for the rest.
-wait -n "$NGINX_PID" "$FPM_PID" 2>/dev/null || true
-_shutdown
+# Exit as soon as nginx or php-fpm dies — triggers _shutdown for the rest. Either one dying is
+# a failure, so exit non-zero even if it exited cleanly (Kubernetes then reports the crash).
+died_status=0
+wait -n "$NGINX_PID" "$FPM_PID" 2>/dev/null || died_status=$?
+echo "[run] nginx or php-fpm exited (status ${died_status})" >&2
+[ "$died_status" -eq 0 ] && died_status=1
+_shutdown "$died_status"

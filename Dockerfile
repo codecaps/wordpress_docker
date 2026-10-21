@@ -44,8 +44,9 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*; \
     php -m | grep -q '^redis$'
 
-# Copy WordPress application metrics endpoint (served via internal nginx on :8080).
-COPY wp-metrics.php /var/www/html/wp-metrics.php
+# Copy WordPress application metrics endpoint (served via internal nginx on :8080). It lives
+# outside the docroot: capsules mount a volume over /var/www/html, which would hide it.
+COPY wp-metrics.php /usr/share/wp-runtime/wp-metrics.php
 
 # Copy nginx config.
 COPY nginx.conf /etc/nginx/nginx.conf
