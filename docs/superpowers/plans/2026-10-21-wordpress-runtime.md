@@ -237,3 +237,25 @@ Before editing capsule-api or site, read `code_capsules_core/.claude/docs/repo-c
 5. D: deploy site.
 6. Announce, then run the job with `REDEPLOY_WORDPRESS_RETROFIT=true` dry run → canary IDs → all (+`INCLUDE_GIT`).
 7. Follow-up: delete `legacy/`, the legacy image switch, archive `wordpress_git_docker`.
+
+---
+
+## Revisions (2026-10-22)
+
+- **Tracks repinned** to the PHP2Shell-patched upstream digests (8.3.36 / 8.4.27 / 8.5.12). All three
+  `php<minor>-r1` builds pass the 7-check smoke test with the real `MIN_PHP_VERSION` guards, and a
+  volume seeded by the legacy 6.8 image moves onto `php8.3-r1` with `wp-config.php`, core and
+  plugins byte-for-byte unchanged.
+- **Task B5 replaced.** The redeploy job on `development` (#232, #235) no longer re-renders
+  Deployments: it swaps only the container image with a conditional JSON patch
+  (`K8sWorkloadService.replaceContainerImage`) and never touches git capsules
+  (`redeployDecision`). Retrofit is rebuilt on top of that: `REDEPLOY_WORDPRESS_RETROFIT=true`
+  adopts a legacy default capsule onto its runtime (`adopt` + save) and then swaps the image.
+  **Git capsules are not retrofitted** — their next build already uses the 8.5 runtime — so
+  `REDEPLOY_WORDPRESS_INCLUDE_GIT` no longer exists. `redeployDecision` recognises
+  `wordpress-runtime` images so retrofitted capsules stay patchable on later tag bumps.
+- **Node 24.** capsule-api and site moved to `node:24.22.1`; both feature branches are merged up
+  to date with `development` and verified on that image.
+- Rollout step 6 becomes: dry run with `RUN_REDEPLOY_WORDPRESS_CAPSULES=true` +
+  `REDEPLOY_WORDPRESS_RETROFIT=true` → canary (`REDEPLOY_WORDPRESS_APPLY=true`,
+  `REDEPLOY_WORDPRESS_CAPSULE_IDS`, `REDEPLOY_WORDPRESS_BATCH_SIZE=1`) → all → unset the `RUN_` var.
