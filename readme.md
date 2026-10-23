@@ -6,7 +6,10 @@ capsules mount `/var/www/html`; the upstream entrypoint copies core in only when
 empty, and WordPress updates itself from then on) or to the capsule's repo (git capsules).
 
 Nginx acts as a reverse proxy in front of PHP-FPM, both running in the same container, on top of
-the official `wordpress:php<minor>-fpm` image.
+the official `wordpress:php<minor>-fpm` image. Out of the box a capsule gets a full-page cache
+that is purged when content changes, a PHP-FPM pool sized to the container, hardened nginx and
+WordPress defaults, WP-CLI, logs in the platform log viewer, and Prometheus exporters. Everything
+is tunable through environment variables.
 
 ---
 
@@ -17,7 +20,11 @@ the official `wordpress:php<minor>-fpm` image.
 | `Dockerfile` | The runtime. Requires `--build-arg BASE_IMAGE` and `--build-arg MIN_PHP_VERSION` (no defaults). |
 | `tracks/php<minor>.env` | One track per PHP minor: `BASE_IMAGE` (digest-pinned), `MIN_PHP_VERSION`, `REVISION`. |
 | `build.sh` / `push.sh` | Build / push one track. |
-| `tests/smoke.sh` | Smoke test for a built image. |
+| `tests/smoke.sh` | Smoke test for a built image (installs WordPress with WP-CLI and exercises cache, purge, limits, headers, shutdown). |
+| `run.sh`, `scripts/` | Container startup: generate config from env, start php-fpm then nginx, supervise, shut down gracefully. |
+| `nginx.conf`, `default.conf`, `nginx/snippets/` | nginx configuration (static parts; the dynamic parts are generated at startup). |
+| `runtime/` | Files installed to `/usr/share/wp-runtime`: the platform prepend and the runtime mu-plugin. |
+| `wp-metrics.php` | WordPress application metrics endpoint (internal). |
 | `git/` | Git capsule image: the runtime plus the capsule's repo (see `git/README.md`). |
 | `docker_run.sh` | Run a locally built runtime against a MySQL on the host. |
 | `legacy/` | Per-WordPress-version images for capsules not yet retrofitted. Delete once capsule-api's legacy image map is gone. |
@@ -38,7 +45,8 @@ Images go to `europe-west4-docker.pkg.dev/appstrax/main/wordpress-runtime`:
 1. Bump the track: `BASE_IMAGE` digest
    (`docker buildx imagetools inspect wordpress:php8.4-fpm --format '{{json .Manifest.Digest}}'`)
    and `REVISION` in `tracks/php<minor>.env`. Raise `MIN_PHP_VERSION` when a security fix makes
-   older PHP unacceptable.
+   older PHP unacceptable. Any change to the image contents (nginx, scripts, runtime files) also
+   needs a `REVISION` bump once the previous revision has been pushed.
 
    Renovate (`renovate.json`) opens these digest PRs every Monday morning, one per track. It does
    not touch `REVISION`: **the PR author must bump `REVISION` in the same PR** — the `runtime`
@@ -51,21 +59,27 @@ Images go to `europe-west4-docker.pkg.dev/appstrax/main/wordpress-runtime`:
 6. Run capsule-api's `redeploy-wordpress-capsules` job to roll the new tag to every capsule on
    that track.
 
+Third-party binaries (Prometheus exporters, WP-CLI, PhpRedis) are pinned by version and checksum
+in the `Dockerfile`; bump the `ARG`s together with the published checksums.
+
 ---
 
 ## Container Startup
 
 `run.sh` is executed on container start. It:
 
-1. Writes custom PHP ini values from `$WORDPRESS_CUSTOM_INI` to `$PHP_INI_DIR/conf.d/zz-custom.ini`
-2. Writes custom PHP-FPM pool config from `$WORDPRESS_FPM_CONF` to `/usr/local/etc/php-fpm.d/zz-custom.conf`
-3. Generates nginx config fragments from environment variables (rate limits, cache, security headers, etc.)
-4. Validates nginx configuration with `nginx -t`
-5. Starts nginx, nginx-prometheus-exporter, php-fpm_exporter, php-fpm and the internal wp-cron trigger as supervised background processes
-6. Shuts everything down cleanly on SIGTERM (exit 0), and exits non-zero if nginx or php-fpm dies
+1. Writes custom PHP ini values (defaults + `$WORDPRESS_CUSTOM_INI`) to `$PHP_INI_DIR/conf.d/zz-custom.ini`
+2. Writes the PHP-FPM pool config (sized to the container's cgroup limits + `$WORDPRESS_FPM_CONF`) to `/usr/local/etc/php-fpm.d/zzz-custom.conf`
+3. Generates nginx config fragments from environment variables (rate limits, cache, headers, ...)
+4. Validates the configuration with `nginx -t`. A broken `NGINX_EXTRA_CONF` is disabled (and logged) instead of crash-looping the pod.
+5. Starts php-fpm and waits until it listens (on first boot the upstream entrypoint copies WordPress core into the empty volume first), **then** starts nginx, the Prometheus exporters (as `www-data`) and the internal wp-cron trigger
+6. On `SIGTERM`/`SIGQUIT` shuts nginx and php-fpm down gracefully (in-flight requests finish, bounded by `SHUTDOWN_TIMEOUT_SECONDS`, default 20) and exits 0; exits non-zero if nginx or php-fpm dies
 
-`/healthz` is answered by PHP-FPM's ping path, so it fails when FPM is down.
-Prometheus metrics are exposed on ports **9113** (nginx) and **9253** (PHP-FPM).
+`/healthz` is answered by PHP-FPM's ping path, so it fails when FPM is down. Because nginx only
+starts once FPM listens, a TCP probe on port 80 is also only green when PHP can answer.
+
+nginx access and error logs, php-fpm logs and the slow log all go to the container's stdout/stderr,
+i.e. the platform log viewer. Nothing is written to log files inside the container.
 
 ---
 
@@ -82,71 +96,77 @@ Prometheus metrics are exposed on ports **9113** (nginx) and **9253** (PHP-FPM).
 
 ### WordPress Configuration
 
+#### Platform defaults (the prepend)
+
+A small PHP file (`/usr/share/wp-runtime/prepend.php`, wired in as `auto_prepend_file`) runs before
+every request. It marks the request as HTTPS when Traefik says so, defines a few hardened defaults
+for constants the site has **not** defined itself, and loads the runtime mu-plugin. A constant
+defined in `wp-config.php` or `WORDPRESS_CONFIG_EXTRA` always wins.
+
+| Variable | Default | Constant / effect |
+|---|---|---|
+| `WP_RUNTIME_PREPEND_ENABLED` | `true` | `false` turns the whole prepend off (no defaults, no mu-plugin) |
+| `WP_DISABLE_WP_CRON` | follows `WP_CRON_TRIGGER_ENABLED` | `DISABLE_WP_CRON`: WordPress's page-load cron spawner is off because the runtime triggers cron internally |
+| `WP_DISALLOW_FILE_EDIT` | `true` | `DISALLOW_FILE_EDIT`: the theme/plugin file editors are off (a compromised admin account would otherwise be code execution) |
+| `WP_MEMORY_LIMIT` | `256M` | `WP_MEMORY_LIMIT` (WordPress's own default is 40M) |
+| `WP_MAX_MEMORY_LIMIT` | `512M` | `WP_MAX_MEMORY_LIMIT` (admin requests) |
+| `WP_REDIS_HOST` (+ `WP_REDIS_PORT`, `WP_REDIS_PASSWORD`, `WP_REDIS_DATABASE`, `WP_REDIS_PREFIX`) | unset | When set, the Redis Cache plugin's constants are defined from these (see [Redis Object Cache](#redis-object-cache)) |
+| `WP_RUNTIME_MU_PLUGIN_ENABLED` | `true` | Loads the runtime mu-plugin: page-cache purge on content changes, "Purge page cache" in the admin bar, `wp cc cache purge|status` |
+
 #### `WORDPRESS_CONFIG_EXTRA`
 
-Arbitrary PHP injected directly into `wp-config.php` by the upstream WordPress Docker entrypoint. Use this for WordPress constants that belong in `wp-config.php`:
+Arbitrary PHP injected into `wp-config.php` by the upstream WordPress Docker entrypoint (it is
+evaluated on every request, so changes apply on redeploy). Use this for WordPress constants:
 
 ```
-WORDPRESS_CONFIG_EXTRA=define('DISABLE_WP_CRON', true);
-define('FORCE_SSL_ADMIN', true);
-define('WP_MEMORY_LIMIT', '256M');
-define('WP_MAX_MEMORY_LIMIT', '512M');
+WORDPRESS_CONFIG_EXTRA=define('FORCE_SSL_ADMIN', true);
+define('WP_AUTO_UPDATE_CORE', 'minor');
 ```
-
-> **Recommended:** Set `define('DISABLE_WP_CRON', true);` so WordPress doesn't waste a
-> request self-triggering cron via its public URL (which `DISABLE_PUBLIC_WP_CRON` blocks
-> anyway). Cron still runs: `run.sh` drives it internally (`WP_CRON_TRIGGER_ENABLED`,
-> on by default), no platform-level CronJob or public wp-cron.php required.
 
 #### `WORDPRESS_CUSTOM_INI`
 
-Custom PHP ini settings merged with the defaults. Recommended for 2GB RAM / 1 CPU:
+Custom PHP ini settings merged with the defaults. The defaults already include a production
+php.ini, OPcache (shared memory sized to the container: 96M below 320Mi, 128M below 640Mi,
+otherwise 256M, `validate_timestamps=1`/`revalidate_freq=60` so plugin updates are picked up),
+`memory_limit = 256M`, `max_input_vars = 3000` and a large realpath cache. Example override:
 
 ```ini
-memory_limit = 128M
-opcache.enable = 1
-opcache.memory_consumption = 128
-opcache.interned_strings_buffer = 16
-opcache.max_accelerated_files = 10000
+memory_limit = 512M
+max_execution_time = 120
 opcache.validate_timestamps = 0
-opcache.revalidate_freq = 0
-opcache.enable_cli = 0
-opcache.save_comments = 1
-opcache.jit = tracing
-opcache.jit_buffer_size = 64M
-realpath_cache_ttl = 600
-output_buffering = 4096
-max_file_uploads = 10
-max_execution_time = 60
-max_input_time = 60
-default_socket_timeout = 30
 ```
 
 > **Note:** `upload_max_filesize` and `post_max_size` default to `MAX_UPLOAD_SIZE`. Override here only if you need them to differ from the nginx limit.
 
 #### `WORDPRESS_FPM_CONF`
 
-Custom PHP-FPM pool configuration merged with the defaults (`pm = dynamic`, `max_children = 12`,
-`start_servers = 3`, `min/max_spare_servers = 3/6`, `max_requests = 500`). Recommended for 2GB RAM / 1 CPU:
+Custom PHP-FPM pool configuration merged with the defaults. The pool is **sized at startup from the
+container's cgroup limits** (logged as `[fpm-conf] ... -> pm.max_children=N`):
+
+- by memory: `(memory − 128M − OPcache/2) / 64M` per worker,
+- by CPU: 12 workers per CPU,
+- the smaller of the two, clamped to 2–64; `pm = dynamic` with spare servers derived from it.
+
+| Pod | `pm.max_children` |
+|---|---|
+| 256Mi / 0.1 CPU | 2 |
+| 512Mi / 0.25 CPU | 5 |
+| 1Gi / 0.5 CPU | 8–12 |
+| 2Gi / 1 CPU | 12 |
+| 4Gi / 2 CPU | 24 |
+
+Override any value:
 
 ```ini
 [www]
 pm = static
-pm.max_children = 8
-pm.max_requests = 500
+pm.max_children = 16
 request_terminate_timeout = 60s
 ```
 
-**Scaling guide:**
-
-| RAM | CPU | `pm.max_children` |
-|---|---|---|
-| 512MB | 0.5 | 3 |
-| 1GB | 1 | 5 |
-| 2GB | 1 | 8 |
-| 4GB | 2 | 16 |
-
-> **Security note:** `clear_env = no` is set so WordPress can read `WORDPRESS_DB_HOST` etc. via `getenv()`. This also means **all** environment variables in the container are visible to PHP code. Do not inject secrets as env vars that WordPress plugins should not access.
+PHP-FPM listens on `127.0.0.1:9000` only. `clear_env = no` is set so WordPress can read
+`WORDPRESS_DB_HOST` etc. via `getenv()`, which means **all** environment variables are visible to
+PHP code. Do not inject secrets as env vars that WordPress plugins should not access.
 
 ---
 
@@ -154,42 +174,38 @@ request_terminate_timeout = 60s
 
 #### `MAX_UPLOAD_SIZE`
 
-Controls `client_max_body_size` in nginx **and** `upload_max_filesize` / `post_max_size` in PHP, keeping them in sync.
-
-- Default: `64M`
-- Accepts: `64M`, `128M`, `256M`, etc.
-
-This is the single knob for upload size. Do not set `upload_max_filesize` in `WORDPRESS_CUSTOM_INI` to a value larger than this, or nginx will silently reject uploads with 413.
+Controls `client_max_body_size` in nginx **and** `upload_max_filesize` / `post_max_size` in PHP,
+keeping them in sync. Default `64M`; accepts `<n>M` or `<n>G` (`64M`, `256M`, `1G`). Anything else
+(`64MB`, `0`) is rejected with a log line and the default is used.
 
 ---
 
 ### Caching
 
-#### `CACHE_TTL_SECONDS`
+The nginx FastCGI full-page cache is **on by default** for anonymous `GET`/`HEAD` requests, with a
+60-second TTL, stale-while-revalidate, and bypass for logged-in users, commenters, carts and
+checkout (WooCommerce/EDD cookies and paths), previews, search, REST, admin and any response that
+sets a cookie. The runtime mu-plugin purges the whole cache when content changes (posts, pages,
+comments, terms, menus, widgets, theme/plugin changes, relevant options), from the "Purge page
+cache" admin-bar item, and via `wp cc cache purge`. Themes and plugins can `do_action('cc_cache_purge')`.
 
-Enables FastCGI page caching and sets TTL in seconds. Must be a positive integer.
+| Variable | Default | Description |
+|---|---|---|
+| `CACHE_TTL_SECONDS` | `60` | Cache TTL. `0` (or `off`/`false`) disables the page cache. |
+| `CACHE_MAX_SIZE` | `512M` | Upper bound of the on-disk cache (`<n>M`/`<n>G`). |
+| `CACHE_IGNORE_QUERY_PARAMS` | unset | JSON array of query-parameter name patterns to ignore in the cache key, e.g. `'["utm_*","fbclid"]'` (`*` matches any characters; allowed: `A–Z a–z 0–9 _ * -`). |
+| `CACHE_SKIP_EMPTY` | `true` | Never store an empty-bodied 200 (a blank page from a failed output buffer). |
+| `DEBUG_HEADERS` | `false` | `true` adds `X-Cache: HIT|MISS|BYPASS|EXPIRED|...` to PHP responses. |
 
-- Default: unset (caching disabled)
-- Example: `CACHE_TTL_SECONDS=60` enables caching with 60s TTL
-- Example: `CACHE_TTL_SECONDS=600` enables caching with 10-minute TTL
-
-If this variable is not set, nginx runs with caching disabled (`fastcgi_cache_bypass 1` / `fastcgi_no_cache 1`).
-
-> **Which strategy should I use?**
+> **Which TTL should I use?**
 >
-> - Start with `CACHE_TTL_SECONDS=60` for most content sites.
-> - Use a higher value such as `CACHE_TTL_SECONDS=600` for mostly-static sites.
-> - Leave `CACHE_TTL_SECONDS` unset for WooCommerce, membership/LMS, real-time dashboards, or when a WordPress cache plugin manages page caching.
+> - The default `60` is right for most sites: visitors see changes within a minute even if a
+>   purge is missed, and busy pages are rendered at most once a minute.
+> - Raise it (`600`, `3600`) for mostly static sites; the purge-on-publish keeps content fresh.
+> - Set `CACHE_TTL_SECONDS=0` for real-time dashboards, membership/LMS sites with
+>   per-visitor content that does not set cookies, or when a WordPress cache plugin manages page caching.
 
-#### `CACHE_IGNORE_QUERY_PARAMS`
-
-Normalizes the FastCGI cache key by ignoring matching query parameter **names** (WordPress still receives the full query string). Requires `CACHE_TTL_SECONDS` to be set. If unset or `[]`, the cache key uses the full `$request_uri` (default).
-
-- Format: JSON array of strings, e.g. `'["utm_*","fbclid"]'`
-- Wildcards: `*` in a pattern matches any characters in the parameter name (e.g. `utm_*` matches `utm_term`, `utm_source`)
-- Allowed characters per pattern: `A–Z`, `a–z`, `0–9`, `_`, `*`, `-`
-
-Example with `CACHE_IGNORE_QUERY_PARAMS='["utm_*"]'`:
+Cache key normalisation example with `CACHE_IGNORE_QUERY_PARAMS='["utm_*"]'`:
 
 | Request | Cache behavior |
 |---|---|
@@ -198,7 +214,8 @@ Example with `CACHE_IGNORE_QUERY_PARAMS='["utm_*"]'`:
 | `GET /page/1` | HIT — same cache entry |
 | `GET /page/1?page=2&utm_term=xyz` | Key includes `page=2` only (utm params stripped from key) |
 
-Non-ignored query parameters still differentiate cache entries. Parameter order in the URL is not normalized.
+The cache key is `<scheme>|<method>|<host>|<request_uri>`; the purge endpoint (`/.cc-cache-purge`,
+loopback only, token protected) accepts an exact key, a `<prefix>*` or `*`.
 
 ---
 
@@ -206,45 +223,38 @@ Non-ignored query parameters still differentiate cache entries. Parameter order 
 
 | Variable | Default | Description |
 |---|---|---|
-| `RATE_LIMIT_NORMAL_ROUTES_RPM` | `120` | Req/min per IP for public routes |
-| `RATE_LIMIT_PROTECTED_ROUTES_RPM` | `30` | Req/min per IP for wp-admin, wp-login |
-| `RATE_LIMIT_API_ROUTES_RPM` | `60` | Req/min per IP for /wp-json/ |
-| `RATE_LIMIT_MAX_CONN_PER_IP` | `30` | Max concurrent connections per IP |
+| `RATE_LIMIT_NORMAL_ROUTES_RPM` | `300` | Req/min per IP for public routes (burst 100) |
+| `RATE_LIMIT_PROTECTED_ROUTES_RPM` | `120` | Req/min per IP for `/wp-admin/*.php` incl. `admin-ajax.php` (burst 60) |
+| `RATE_LIMIT_LOGIN_ROUTES_RPM` | `30` | Req/min per IP for `wp-login.php` (burst 10), `wp-comments-post.php` (burst 5), `xmlrpc.php` (burst 3) |
+| `RATE_LIMIT_API_ROUTES_RPM` | `300` | Req/min per IP for `/wp-json/` (burst 100; the block editor makes many REST calls) |
+| `RATE_LIMIT_MAX_CONN_PER_IP` | `100` | Max concurrent connections per IP |
 
-All limits are **per client IP**. The client IP is resolved from `X-Forwarded-For`
-(`real_ip_recursive on`), trusting private intermediary ranges plus Cloudflare's
-edge ranges — see [Real Client IP & Cloudflare](#real-client-ip--cloudflare). If
-the true client IP is not resolved correctly, every visitor shares one bucket and
-trips these limits with spurious `429`s.
+Static assets are never rate-limited. All limits are **per client IP**, resolved from
+`X-Forwarded-For` (see below). If the true client IP is not resolved correctly, every visitor
+shares one bucket and trips these limits with spurious `429`s; the `limiting requests` log lines
+are in the container logs.
 
 ---
 
 ### Real Client IP & Cloudflare
 
-nginx resolves the real client IP from `X-Forwarded-For` and uses it as the key for
-all rate limits, the per-IP connection limit, access logs, and the IP passed to
-WordPress (`REMOTE_ADDR` / `X-Real-IP`). `set_real_ip_from` in `nginx.conf` trusts:
+nginx resolves the real client IP from `X-Forwarded-For` (`real_ip_recursive on`) and uses it for
+all rate limits, the per-IP connection limit, access logs, and the IP passed to WordPress
+(`REMOTE_ADDR` / `X-Real-IP`). Trusted hops:
 
-- Private intermediary ranges (`10/8`, `172.16/12`, `192.168/16`) — Traefik / k8s LB / VPC.
-- **Cloudflare's published edge ranges**, baked into the image at build time.
+| Variable | Default | Description |
+|---|---|---|
+| `TRUSTED_PROXY_CIDRS` | `10.0.0.0/8 172.16.0.0/12 192.168.0.0/16` | Intermediaries whose `X-Forwarded-For` is believed (Traefik / k8s LB / VPC). Space- or comma-separated; narrow it to the Traefik pod CIDR where possible. |
 
-Cloudflare support is **automatic** — no env var. When the container is proxied by
-Cloudflare, the edge IPs (which are public) appear in `X-Forwarded-For`. Trusting
-them lets recursion walk past the edge to the real visitor. Without this, recursion
-would stop at a Cloudflare IP and **collapse every visitor onto a handful of edge
-IPs**, tripping the per-IP rate and connection limits. When Cloudflare is not in
-front, trusting these ranges is harmless.
+plus **Cloudflare's published edge ranges**, baked into the image at build time from
+`cloudflare.com/ips-v4` and `ips-v6` (falling back to `cloudflare_ips.fallback.conf` with a
+warning if the fetch fails). Rebuild the image to refresh them.
 
-The ranges are fetched from `cloudflare.com/ips-v4` and `ips-v6` during `docker build`.
-**Rebuild the image to refresh them.** If the fetch fails at build time, a
-version-controlled snapshot (`cloudflare_ips.fallback.conf`) is used and a warning
-is logged.
-
-> ⚠️ **Security:** Trusting Cloudflare's *public* ranges means a client that can
-> reach the origin **directly** (bypassing Cloudflare) could forge `X-Forwarded-For`
-> to spoof or rotate client IPs — evading rate limits or framing another IP. Lock the
-> origin to Cloudflare only: edge IP allowlist at your load balancer, Authenticated
-> Origin Pulls, or a Cloudflare Tunnel.
+> ⚠️ **Security:** Trusting Cloudflare's *public* ranges means a client that can reach the origin
+> **directly** (bypassing Cloudflare) could forge `X-Forwarded-For`. Lock the origin to Cloudflare
+> only: edge IP allowlist at your load balancer, Authenticated Origin Pulls, or a Cloudflare Tunnel.
+> Traefik itself must forward `X-Forwarded-For` from Cloudflare (`forwardedHeaders.trustedIPs`);
+> check the access log's `xff=... realip=...` fields on a test capsule.
 
 ---
 
@@ -254,16 +264,21 @@ is logged.
 |---|---|---|
 | `XMLRPC_ENABLED` | `false` | Set to `true` to enable XML-RPC (Jetpack, WP mobile app, external publishing) |
 | `DISABLE_PUBLIC_WP_CRON` | `true` | Restrict `wp-cron.php` to `127.0.0.1`. Triggered internally instead — see `WP_CRON_TRIGGER_ENABLED`. |
-| `WP_CRON_TRIGGER_ENABLED` | `true` | `run.sh` runs a loop that calls `wp-cron.php` over `127.0.0.1` on an interval, since `DISABLE_PUBLIC_WP_CRON` blocks WordPress's own public-URL self-trigger. Set to `false` only if the capsule triggers cron some other way. |
-| `WP_CRON_TRIGGER_INTERVAL_SECONDS` | `300` | Seconds between internal `wp-cron.php` triggers. |
+| `WP_CRON_TRIGGER_ENABLED` | `true` | `run.sh` calls `wp-cron.php` over `127.0.0.1` on an interval. Set to `false` only if the capsule triggers cron some other way. |
+| `WP_CRON_TRIGGER_INTERVAL_SECONDS` | `60` | Seconds between internal `wp-cron.php` triggers. |
 | `SESSION_COOKIE_SECURE` | `1` | PHP `session.cookie_secure`. Set to `0` for local HTTP development. |
-| `CSP_HEADER` | permissive default | Full `Content-Security-Policy` header value. Set to empty string to disable. |
-| `DEBUG_HEADERS` | `false` | Set to `true` to expose `X-Cache` response header (reveals cache HIT/MISS/BYPASS). |
+| `CSP_HEADER` | see below | Full `Content-Security-Policy` value. Empty string disables it. Quotes (`"`), `$` and backslashes are rejected (default used). |
+| `HSTS_HEADER` | `max-age=31536000` | `Strict-Transport-Security` value, sent only on HTTPS requests. Empty string disables it. Add `; includeSubDomains` yourself only if every subdomain of the domain is HTTPS. |
+| `NGINX_WORKER_PROCESSES` | from the CPU quota (1–4) | nginx worker count. |
+| `SHUTDOWN_TIMEOUT_SECONDS` | `20` | How long a graceful shutdown waits for in-flight requests before terminating nginx/php-fpm. |
 
 Default CSP:
 ```
-default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob: https:; frame-ancestors 'self';
+default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob: https:; connect-src 'self' https: wss:; frame-ancestors 'self';
 ```
+
+Security headers are set with the headers-more module, so they are present on every response
+(static assets and `NGINX_EXTRA_CONF` locations included).
 
 ---
 
@@ -271,36 +286,61 @@ default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob: https:; frame-ances
 
 #### `NGINX_EXTRA_CONF`
 
-Raw nginx config injected into the `server {}` block before the PHP handler. Useful for custom proxy rules, headless WordPress API routes, WooCommerce custom endpoints.
+Raw nginx config injected into the `server {}` block before the PHP handler. Useful for custom
+proxy rules, headless WordPress API routes, WooCommerce custom endpoints.
 
 ```
 NGINX_EXTRA_CONF=location /custom-api/ { proxy_pass http://internal-service:8080/; }
 ```
 
+If the fragment does not pass `nginx -t`, the container logs the error, disables the fragment and
+starts without it, so a typo cannot take the site down.
+
 ---
 
-### Prometheus Metrics (Build-time)
+### Build-time variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `NGINX_EXPORTER_VERSION` | `1.4.0` | Build-time: nginx-prometheus-exporter version |
-| `FPM_EXPORTER_VERSION` | `2.2.0` | Build-time: php-fpm_exporter version |
-| `TARGETARCH` | `amd64` | Build-time: target CPU architecture (`amd64`, `arm64`) |
-| `BASE_IMAGE` | none (required) | Build-time: set from the track by `build.sh` |
-| `MIN_PHP_VERSION` | none (required) | Build-time: set from the track by `build.sh`; the build fails on an older PHP |
+| `BASE_IMAGE` | none (required) | Set from the track by `build.sh` |
+| `MIN_PHP_VERSION` | none (required) | Set from the track by `build.sh`; the build fails on an older PHP |
+| `TARGETARCH` | `amd64` | Target CPU architecture (`amd64`, `arm64`) |
+| `NGINX_EXPORTER_VERSION` / `_SHA256_*` | `1.5.3` | nginx-prometheus-exporter version and release checksums |
+| `FPM_EXPORTER_VERSION` / `_SHA256_*` | `2.2.0` | php-fpm_exporter version and release checksums |
+| `WP_CLI_VERSION` / `WP_CLI_SHA512` | `2.12.0` | WP-CLI version and checksum |
+| `PHPREDIS_VERSION` | `6.3.0` | PhpRedis PECL version |
+
+---
+
+## WP-CLI
+
+`wp` is installed in the image (run it as `wp --allow-root --path=/var/www/html ...` from a shell
+in the container). Besides the usual commands (`wp core version`, `wp plugin list`,
+`wp search-replace`, `wp cron event run --due-now`), the runtime adds:
+
+- `wp cc cache status` — whether the page cache is on, and its TTL
+- `wp cc cache purge` — purge the page cache
+
+The platform prepend applies to the CLI too, so `wp` sees the same constants as the site.
 
 ---
 
 ## Prometheus Metrics
 
-The container exposes two Prometheus metrics ports. No sidecar required.
+The container exposes two Prometheus metrics ports (the exporters run as `www-data`). No sidecar required.
 
 | Port | Exporter | Key metrics |
 |---|---|---|
 | `9113` | nginx-prometheus-exporter | `nginx_connections_active`, `nginx_http_requests_total`, `nginx_connections_waiting` |
 | `9253` | php-fpm_exporter | `phpfpm_listen_queue`, `phpfpm_max_children_reached_total`, `phpfpm_active_processes`, `phpfpm_slow_requests_total` |
 
-WordPress application metrics (post counts, user counts, autoloaded options, `wp_cron_trigger_*`) are available at `http://127.0.0.1:8080/wp-metrics` from inside the container only. The script lives at `/usr/share/wp-runtime/wp-metrics.php`, outside the docroot, so a volume over `/var/www/html` does not hide it.
+WordPress application metrics (post counts, user counts, autoloaded options, the installed core
+version, `wp_cron_trigger_*`) are available at `http://127.0.0.1:8080/wp-metrics` from inside the
+container only. The script lives at `/usr/share/wp-runtime/wp-metrics.php`, outside the docroot,
+so a volume over `/var/www/html` does not hide it.
+
+> The cluster's Prometheus must be told to scrape these ports (a PodMonitor on the WordPress pod
+> labels); nothing scrapes them by default.
 
 **Recommended Prometheus alerts:**
 
@@ -324,38 +364,21 @@ WordPress application metrics (post counts, user counts, autoloaded options, `wp
 
 ## Redis Object Cache
 
-The **PhpRedis** C extension is baked into this image (see the `pecl install redis`
-layer in the `Dockerfile`). It is significantly faster than the pure-PHP Predis
-client because every `wp_cache_*` and transient call is a Redis round-trip, and
-PhpRedis does the protocol/serialization work in C. To use Redis for object caching:
+The **PhpRedis** C extension is baked into this image. To use Redis for object caching:
 
-1. Install and activate the [Redis Cache](https://wordpress.org/plugins/redis-cache/) plugin.
-2. Set constants via `WORDPRESS_CONFIG_EXTRA`:
-   ```
-   WORDPRESS_CONFIG_EXTRA=define('WP_REDIS_CLIENT', 'phpredis');
-   define('WP_REDIS_HOST', getenv('REDIS_HOST'));
-   define('WP_REDIS_PORT', 6379);
-   define('WP_REDIS_PREFIX', 'mysite_');
-   define('WP_REDIS_TIMEOUT', 1);
-   define('WP_REDIS_READ_TIMEOUT', 1);
-   ```
+1. Create a Redis capsule and set `WP_REDIS_HOST` (and `WP_REDIS_PASSWORD` if needed) on the
+   WordPress capsule. The prepend then defines `WP_REDIS_HOST`, `WP_REDIS_PORT` (6379),
+   `WP_REDIS_PREFIX` (defaults to the database name, so sites sharing one Redis never collide),
+   `WP_REDIS_CLIENT=phpredis` and 1-second timeouts.
+2. Install and activate the [Redis Cache](https://wordpress.org/plugins/redis-cache/) plugin and
+   click *Enable Object Cache* (or `wp redis enable`).
 
-> **Client selection:** the Redis Cache drop-in auto-selects PhpRedis when the
-> extension is present, so `WP_REDIS_CLIENT` is optional — but setting it explicitly
-> documents intent and prevents a silent fall back to Predis if the extension ever
-> fails to load.
+Override any constant in `WORDPRESS_CONFIG_EXTRA`; the prepend never redefines a constant the
+site defines itself.
 
-> **Fail fast:** keep `WP_REDIS_TIMEOUT`/`WP_REDIS_READ_TIMEOUT` low (1s). Because
-> Redis sits on the critical path of every request, a slow/unreachable Redis should
-> error quickly rather than hang PHP-FPM workers. (These are already the drop-in
-> defaults; setting them is belt-and-suspenders.)
-
-> **Note:** the free Redis Cache drop-in opens a fresh (non-persistent) connection
-> per request for single-node setups — `WP_REDIS_PERSISTENT`/`pconnect` only applies
-> to its cluster path. The per-request `connect()` to a local Redis is one cheap
-> round-trip; persistent connections are an Object Cache Pro feature.
-
-> **Multi-tenancy:** Always set `WP_REDIS_PREFIX` to a unique value per site when multiple sites share a Redis instance. Without it, two WordPress sites will corrupt each other's object cache.
+> **Fail fast:** keep `WP_REDIS_TIMEOUT`/`WP_REDIS_READ_TIMEOUT` low (1s). Redis sits on the
+> critical path of every request, so a slow/unreachable Redis should error quickly rather than hang
+> PHP-FPM workers.
 
 ---
 
@@ -363,23 +386,31 @@ PhpRedis does the protocol/serialization work in C. To use Redis for object cach
 
 | Script | Purpose |
 |---|---|
-| `run.sh` | Orchestrates startup; supervises nginx, exporters, and php-fpm |
-| `scripts/configure_wordpress_custom_ini.sh` | Merges `WORDPRESS_CUSTOM_INI` with defaults |
-| `scripts/configure_wordpress_fpm_conf.sh` | Merges `WORDPRESS_FPM_CONF` with defaults |
-| `scripts/configure_nginx_overrides.sh` | Generates all dynamic nginx config fragments |
+| `run.sh` | Orchestrates startup; supervises nginx, exporters, php-fpm and the cron trigger; graceful shutdown |
+| `scripts/configure_wordpress_custom_ini.sh` | Merges `WORDPRESS_CUSTOM_INI` with the defaults (OPcache sized to the container, prepend) |
+| `scripts/configure_wordpress_fpm_conf.sh` | Sizes the pool from the cgroup limits, merges `WORDPRESS_FPM_CONF` |
+| `scripts/configure_nginx_overrides.sh` | Generates all dynamic nginx config fragments and the cache state for the mu-plugin |
+| `scripts/lib/runtime_env.sh` | Shared validators and cgroup helpers |
 | `scripts/lib/merge_and_write_config.sh` | Shared awk-based merge logic |
+| `runtime/prepend.php` | Platform prepend (HTTPS, hardened constants, loads the mu-plugin) |
+| `runtime/mu-plugins/code-capsules.php` | Runtime mu-plugin (cache purge, admin bar, WP-CLI commands) |
 
 ---
 
 ## Optimisations Included
 
-- **OPcache**: reduces CPU usage on repeated requests
+- **Full-page cache** on by default with purge-on-publish, stale-while-revalidate and WooCommerce-aware bypass rules
+- **OPcache** sized to the container; production `php.ini`
+- **PHP-FPM pool** sized to the container's memory and CPU
 - **Gzip compression**: reduces response sizes by 60–80%
 - **Static file caching**: 30-day browser cache for assets; 1h for XML/txt
-- **FastCGI page cache**: configurable TTL (default 60s), bypassed for logged-in users, carts, admin
-- **Security headers**: HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy, X-Permitted-Cross-Domain-Policies
-- **PHP execution blocked** in uploads, cache, and upgrade directories
-- **Sensitive files blocked**: `wp-config.php`, `debug.log`, `.env`, `.git`, `wp-config-sample.php`, plugin/theme readme files, `wp-includes/*.php`
-- **Rate limiting**: three configurable zones (normal, protected, API) plus per-IP connection limit, keyed on the real client IP behind Traefik/Cloudflare
-- **Cloudflare-aware real IP**: edge ranges baked at build so XFF recursion resolves the true visitor IP, preventing spurious 429s
-- **Prometheus metrics**: in-container nginx and PHP-FPM exporters, no sidecar required
+- **Security headers** on every response: HSTS (HTTPS only), CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy, X-Permitted-Cross-Domain-Policies
+- **Hardened WordPress defaults**: file editors off, sane memory limits, cron run by the platform
+- **PHP execution blocked** in uploads, cache, and upgrade directories; drop-ins and `wp-includes` not requestable
+- **Sensitive files blocked** (404): `wp-config.*`, dumps and backups (`.sql`, `.bak`, `.old`...), `debug.log`, `.env`, `.git`, readme/changelog files
+- **Rate limiting**: four configurable zones (public, wp-admin, login/comments/xmlrpc, REST) plus a per-IP connection limit, keyed on the real client IP behind Traefik/Cloudflare
+- **Cloudflare-aware real IP**: edge ranges baked at build so XFF recursion resolves the true visitor IP
+- **Graceful deploys**: nginx waits for PHP-FPM before accepting traffic; shutdown finishes in-flight requests
+- **Logs in the platform**: nginx and PHP logs on stdout/stderr
+- **Prometheus metrics**: in-container nginx and PHP-FPM exporters plus WordPress metrics
+- **WP-CLI** in the image

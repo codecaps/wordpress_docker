@@ -259,3 +259,62 @@ Before editing capsule-api or site, read `code_capsules_core/.claude/docs/repo-c
 - Rollout step 6 becomes: dry run with `RUN_REDEPLOY_WORDPRESS_CAPSULES=true` +
   `REDEPLOY_WORDPRESS_RETROFIT=true` → canary (`REDEPLOY_WORDPRESS_APPLY=true`,
   `REDEPLOY_WORDPRESS_CAPSULE_IDS`, `REDEPLOY_WORDPRESS_BATCH_SIZE=1`) → all → unset the `RUN_` var.
+
+## Revisions (2026-10-23) — production hardening before the first test deployment
+
+An audit of the runtime (security, performance/compatibility, integration, competitors) found
+defects that would have shipped in `php8.x-r1`. All are fixed in the image; `REVISION` stays `1`
+because nothing had been pushed yet (verify with `docker buildx imagetools inspect` before pushing —
+if an `r1` exists, bump to `r2` and `WORDPRESS_RUNTIME_TAGS`).
+
+Verified defects fixed:
+
+- **Every pod stop hung 30s and was SIGKILLed**: the upstream image's `STOPSIGNAL` is `SIGQUIT`
+  and `run.sh` trapped only TERM/INT. Now `STOPSIGNAL SIGTERM`, TERM/INT/QUIT all handled, and
+  nginx/php-fpm get a graceful `QUIT` bounded by `SHUTDOWN_TIMEOUT_SECONDS`.
+- **PHP-FPM listened on all interfaces**: `listen = 9000` (and the upstream `zz-docker.conf`
+  overrode our pool file, which sorted before it). Now `listen = 127.0.0.1:9000` in `zzz-custom.conf`.
+- **nginx logs went to files** inside the container (no rotation, invisible to Loki). Now stdout/stderr.
+- **`add_header` inheritance** dropped every security header on static assets and, with
+  `DEBUG_HEADERS=true`, on all PHP responses. Headers now use `more_set_headers` (headers-more module).
+- **nginx started before php-fpm** (and before the first-boot core copy), so TCP readiness passed
+  while requests got 502/404. php-fpm now starts first and nginx waits for it to listen.
+- **Cache bypass regexes over-matched** (`~*s=` matched `?tags=`, `^/cart/?` matched `/cartoons/`).
+  Anchored. Default cache key now uses `$forwarded_scheme`.
+- **No cache purge**: added the Debian `ngx_cache_purge` module, a token-protected loopback purge
+  location and a runtime mu-plugin (loaded through a pre-initialised hook from the prepend, no
+  files on the volume) that purges on content changes, from the admin bar and via `wp cc cache purge`.
+- **Page cache was off by default**; now `CACHE_TTL_SECONDS=60` by default (`0` disables).
+- **FPM pool fixed at 12 children / OPcache 256M / `worker_processes auto`** regardless of the pod:
+  now sized from the cgroup memory and CPU limits (`scripts/lib/runtime_env.sh`).
+- **Rate limits too low for wp-admin/REST**: new defaults (public 300, wp-admin 120, REST 300 r/m)
+  and a separate `login_routes` zone (30 r/m) for `wp-login.php`, `wp-comments-post.php`, `xmlrpc.php`.
+- **HTTPS never signalled to PHP** and nginx redirects downgraded to `http://`: `HTTPS`/`REQUEST_SCHEME`/
+  `SERVER_PORT` FastCGI params from `X-Forwarded-Proto`, `absolute_redirect off`, prepend sets `$_SERVER['HTTPS']`.
+- **`DISABLE_WP_CRON` undefined** (page loads spawned a doomed loopback request), cron every 5 min:
+  the prepend defines it; interval default 60s.
+- **`MAX_UPLOAD_SIZE` unvalidated for PHP** (`64MB` → 64 bytes): shared validator for nginx and PHP.
+- **Owner env values could crash-loop the pod**: `CSP_HEADER`/`HSTS_HEADER` validated,
+  `NGINX_EXTRA_CONF` disabled on `nginx -t` failure, invalid `CACHE_*` fall back instead of exiting.
+- **Deny list gaps** (`wp-config.old`, `*.sql`, plugin `changelog.txt`, drop-ins): blocked, as 404.
+- **HSTS `includeSubDomains`** removed from the default (customer apex domains); `HSTS_HEADER` env.
+  Deprecated `X-XSS-Protection` removed; CSP allows `wss:`.
+- **Supply chain**: exporter binaries and WP-CLI verified by checksum, PhpRedis pinned (6.3.0),
+  exporters run as `www-data`, production `php.ini`, ImageMagick PostScript coders closed.
+- **Hardened WordPress defaults** via the prepend: `DISALLOW_FILE_EDIT`, `WP_MEMORY_LIMIT` 256M,
+  `WP_MAX_MEMORY_LIMIT` 512M, `WP_REDIS_*` from env; owner-defined constants are never overridden.
+- **WP-CLI** installed; `wp-metrics.php` counts all autoload values (WP ≥ 6.6) and reports the core version.
+- `tests/smoke.sh` now installs WordPress with WP-CLI and checks: FPM on loopback, logs on stdout,
+  headers on static assets, HSTS, redirect scheme, prepend constants, cache HIT, bypass rules,
+  purge on publish and via CLI, login rate limit + log line, sensitive files, upload-size sync,
+  metrics, FPM sizing log, graceful stop, plus the original install/volume/healthz/git checks.
+
+Not changed here (follow-ups recorded in the audit write-up): capsule-api default probes
+(`/healthz` HTTP), default resources (512Mi), seeding visible configs on create, a PodMonitor for
+the exporters, retrofit of git capsules' `phpVersion`, unit tests for the retrofit job, pinning
+`WP_RUNTIME_REF` in the Tekton task, SMTP, safe first boot, backups of the files volume.
+
+Rollout order constraints confirmed by the audit: push `php8.x-r1` **before** deploying capsule-api
+or the Tekton task; merge this branch to `main` and push **before** deploying the Tekton task
+(it clones `codecaps/wordpress_docker` at `main` for `git/Dockerfile`); deploy the site only after
+every cluster's capsule-api is upgraded (the new site omits `version`, which the old API requires).
