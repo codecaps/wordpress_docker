@@ -11,19 +11,20 @@ log() {
     echo "[fpm-conf] $*"
 }
 
-# Size the pool to the container instead of assuming a 1-2GB VM:
-#   by memory: what is left after nginx, the exporters, the FPM master and the resident OPcache,
-#              at ~64MB per WordPress worker;
-#   by CPU:    12 workers per CPU (WordPress waits on MySQL/NFS a lot, so more than 1:1 pays off);
-#   clamped to 2..64. WORDPRESS_FPM_CONF still overrides any of these.
+# Size the pool to the container instead of assuming a 1-2GB VM. Measured on the platform's
+# smallest plan (267MiB): nginx + exporters + FPM master ≈ 80MB, a fresh WordPress worker ≈ 35-50MB
+# (plugins add more). Two workers stalled the site when two slow requests coincided, so:
+#   by memory: (memory − 96MB base − OPcache/4) / 56MB per worker;
+#   by CPU:    12 workers per CPU (WordPress waits on MySQL/NFS a lot);
+#   the smaller of the two, clamped to 3..64. WORDPRESS_FPM_CONF still overrides any of these.
 _mem_mb="$(cgroup_memory_limit_mb)"
 _cpus="$(cgroup_cpu_limit)"
 _opcache_mb="$(opcache_memory_mb_for "$_mem_mb")"
-_reserve_mb=$(( 128 + _opcache_mb / 2 ))
-_by_mem=$(( (_mem_mb - _reserve_mb) / 64 ))
+_reserve_mb=$(( 96 + _opcache_mb / 4 ))
+_by_mem=$(( (_mem_mb - _reserve_mb) / 56 ))
 _by_cpu=$(( _cpus * 12 ))
 _max_children=$(( _by_mem < _by_cpu ? _by_mem : _by_cpu ))
-_max_children="$(clamp "$_max_children" 2 64)"
+_max_children="$(clamp "$_max_children" 3 64)"
 _min_spare="$(clamp $(( _max_children / 4 )) 1 "$_max_children")"
 _start="$_min_spare"
 _max_spare="$(clamp $(( _max_children / 2 )) "$_start" "$_max_children")"
@@ -58,7 +59,9 @@ request_terminate_timeout = 120s
 request_slowlog_timeout = 5s
 slowlog = /proc/self/fd/2
 
-; Docker-friendly logging.
+; Docker-friendly logging. nginx already logs every request with the real client IP, timing and
+; cache status, so php-fpm's own access log (on in the upstream image) would duplicate each line.
+access.log = /dev/null
 catch_workers_output = yes
 decorate_workers_output = no
 

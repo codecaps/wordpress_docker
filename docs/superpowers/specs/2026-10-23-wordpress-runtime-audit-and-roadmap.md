@@ -11,7 +11,7 @@ the built image or the code), fixes applied to the runtime, and a 27-check smoke
 | Piece | Branch | State |
 |---|---|---|
 | Runtime image | `wordpress_docker` `feat/wordpress-runtime` | Complete + hardened (this audit). Builds `php8.3-r1`, `php8.4-r1`, `php8.5-r1`. **Not pushed** (10 commits ahead of `origin/main`; `origin/main` even lacks the PHP2Shell hotfix). |
-| Capsule API | `feat/wordpress-php-runtime` (worktree `.worktrees/capsule-api--feature`) | Complete per plan; 870 unit tests pass; image `capsule-api:0.3.426.featwordpress-php-runtime.97ab51cd` builds. **No upstream branch, not pushed.** |
+| Capsule API | `feat/wordpress-php-runtime` (worktree `.worktrees/capsule-api--feature`) | Complete per plan + r2 tags + database creation; 876 unit tests pass; image `capsule-api:0.3.426.featwordpress-php-runtime.b68dcbb6` deployed to cc-proxmox. **No upstream branch, not pushed.** |
 | Site | `feat/wordpress-php-version` | Complete; 1127 Karma specs, `build:prod`, `tsc`, all guard scripts pass. **Not pushed.** |
 | Tekton task | `feat/wordpress-runtime-image` (worktree `.worktrees/infra-cluster-pipelines--runtime`) | Complete. **Not pushed.** |
 | Registry | `europe-west4-docker.pkg.dev/appstrax/main/wordpress-runtime` | **Pushed 2026-10-23**: `php8.3-r1`, `php8.4-r1`, `php8.5-r1` (plus the moving aliases) — exactly the tags in capsule-api's `WORDPRESS_RUNTIME_TAGS`. Capsule API image `capsule-api:0.3.426.featwordpress-php-runtime.97ab51cd` built locally, not pushed. |
@@ -170,10 +170,13 @@ the site was run locally against the test platform and exercised in Chrome (spac
   through the wizard; Deployment on `php8.5-r1`; core copied onto the empty NFS volume; `/` → 302 to
   the installer, installer 200, XML-RPC 403. **Defect**: the TCP startup probe killed the first
   container mid-copy (fixed in r2 with the 503 holding page; see the plan revisions).
-- **Platform gaps found**: no database creation on the MySQL capsule (second site cannot install);
+- **Platform gaps found**: no database creation on the MySQL capsule (second site cannot install) —
+  **fixed the same day in capsule-api** (`WordpressDatabaseService.ensureDatabase`, `CREATE DATABASE IF
+  NOT EXISTS` as the MySQL capsule's root at the start of every WordPress deploy; names limited to
+  `^[A-Za-z0-9_]+$`; capsule-api commit `b68dcbb6`);
   storage capsule shareable with no subPath (two sites, one docroot); Basic plan 0.28GB → 2 FPM
-  workers; test cluster NAT hides visitor IPs; php-fpm's own access log duplicates nginx's lines
-  (drop it in a later revision).
+  workers (r3 raises the floor to 3 from measured usage); test cluster NAT hides visitor IPs;
+  php-fpm's own access log duplicated nginx's lines (off in r3).
 
 ## 7. Test evidence
 
@@ -191,6 +194,7 @@ the site was run locally against the test platform and exercised in Chrome (spac
 | php8.3-r1 | ok | 27/27 |
 | php8.5-r1 | ok | 27/27 |
 | php8.3-r2 / php8.4-r2 / php8.5-r2 (holding page) | ok, pushed | 28/28 each |
+| php8.3-r3 / php8.4-r3 / php8.5-r3 (pool floor 3, no FPM access log) | ok, pushed | 28/28 each |
 
 (The first 8.4 run exposed a `pipefail` + `docker logs | grep -q` race in the smoke script itself,
 now fixed; the images were unaffected.)

@@ -148,17 +148,21 @@ opcache.validate_timestamps = 0
 Custom PHP-FPM pool configuration merged with the defaults. The pool is **sized at startup from the
 container's cgroup limits** (logged as `[fpm-conf] ... -> pm.max_children=N`):
 
-- by memory: `(memory − 128M − OPcache/2) / 64M` per worker,
+- by memory: `(memory − 96M − OPcache/4) / 56M` per worker (measured: nginx, exporters and the FPM
+  master need ~80M; a fresh WordPress worker ~35–50M, more with heavy plugins),
 - by CPU: 12 workers per CPU,
-- the smaller of the two, clamped to 2–64; `pm = dynamic` with spare servers derived from it.
+- the smaller of the two, clamped to 3–64; `pm = dynamic` with spare servers derived from it.
 
 | Pod | `pm.max_children` |
 |---|---|
-| 256Mi / 0.1 CPU | 2 |
-| 512Mi / 0.25 CPU | 5 |
-| 1Gi / 0.5 CPU | 8–12 |
+| 0.28Gi / 0.07 CPU (Basic plan) | 3 |
+| 512Mi / 0.25 CPU | 6 |
+| 1Gi / 0.5 CPU | 12 |
 | 2Gi / 1 CPU | 12 |
 | 4Gi / 2 CPU | 24 |
+
+php-fpm's own access log is off (nginx logs every request with the real client IP, timing and cache
+status); PHP errors and the slow log still go to the container's stderr.
 
 Override any value:
 

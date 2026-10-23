@@ -342,3 +342,12 @@ Platform findings from the live test (capsule-api, not the image):
   logs "reached pm.max_children" under probe + visitor traffic.
 - On cc-proxmox every external visitor arrives as `192.168.1.1` (the test network's NAT), so the
   per-IP limits see one client; verify the real-IP chain on production clusters.
+
+## Revisions (2026-10-23, r3) — pool floor and log noise
+
+Measured on the Basic plan (267MiB): the whole pod idles at ~70MiB (nginx + exporters + FPM master
+≈ 80MB RSS, a fresh WordPress worker 35–50MB). The r1/r2 formula gave that plan 2 workers, and two
+slow requests (the WordPress installer calling api.wordpress.org took 41s) stalled the whole site.
+r3 sizes the pool as `(memory − 96M − OPcache/4) / 56M`, clamped to 3–64 (Basic plan → 3, 512Mi →
+6, 1Gi+ → 12 per CPU), and turns off php-fpm's own access log, which duplicated every nginx
+request line in the platform log viewer. `REVISION=3`; capsule-api `WORDPRESS_RUNTIME_TAGS` → `php8.x-r3`.
