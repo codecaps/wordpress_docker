@@ -318,3 +318,27 @@ Rollout order constraints confirmed by the audit: push `php8.x-r1` **before** de
 or the Tekton task; merge this branch to `main` and push **before** deploying the Tekton task
 (it clones `codecaps/wordpress_docker` at `main` for `git/Dockerfile`); deploy the site only after
 every cluster's capsule-api is upgraded (the new site omits `version`, which the old API requires).
+
+## Revisions (2026-10-23, r2) — first live test on cc-proxmox
+
+`php8.x-r1` was pushed and tested on the cc-proxmox cluster with the feature capsule-api. The legacy
+→ runtime switch (6.8 capsule to PHP 8.4, `XMLRPC_ENABLED` adopted, existing volume untouched),
+the config card, logs in the platform viewer, page cache HIT and all headers worked. One defect:
+a **new** capsule's first boot copies WordPress core onto an NFS volume (~30-60s); with nginx
+waiting for php-fpm, the default TCP startup probe (10s + 5×10s) killed the container mid-copy
+once before the retry succeeded. `r2` starts nginx first and serves a 503 "starting up" page
+(`runtime/html/starting.html`, `Retry-After: 5`, `/healthz` included) until FPM listens, so TCP
+probes pass immediately and HTTP probes stay honest; the smoke test covers it (`starting-page`).
+`REVISION=2` on every track; capsule-api `WORDPRESS_RUNTIME_TAGS` → `php8.x-r2`.
+
+Platform findings from the live test (capsule-api, not the image):
+- capsule-api never creates the WordPress database on the linked MySQL capsule (only the MySQL
+  capsule's single default database `app` exists), so a second WordPress capsule on the same MySQL
+  capsule cannot install. Jacques: capsule-api should check the database exists and create it.
+- Two WordPress capsules can pick the same storage capsule; both mount the whole PVC at
+  `/var/www/html` (no subPath), so they share one docroot. Use a per-capsule subPath or create a
+  dedicated storage capsule per WordPress capsule.
+- The Basic WordPress plan is 0.28GB / 7% CPU; the runtime sizes that to 2 FPM workers and php-fpm
+  logs "reached pm.max_children" under probe + visitor traffic.
+- On cc-proxmox every external visitor arrives as `192.168.1.1` (the test network's NAT), so the
+  per-IP limits see one client; verify the real-IP chain on production clusters.

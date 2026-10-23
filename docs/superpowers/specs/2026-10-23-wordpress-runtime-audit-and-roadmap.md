@@ -156,6 +156,25 @@ deploys, editable PHP/FPM/nginx config, logs in the platform viewer.
 **P3**
 - PHP EOL lifecycle UI; WordPress core version shown in the UI (metric already exported).
 
+## 6b. Live test on cc-proxmox (2026-10-23)
+
+With `php8.x-r1` in the registry and the feature capsule-api deployed to `capsule-api` on cc-proxmox,
+the site was run locally against the test platform and exercised in Chrome (space `static-test-xllb`):
+
+- **Legacy capsule → runtime** (`wordpress-capsule-uufu`, `wordpress:6.8-php8.3.36`): the config card
+  showed "Legacy image (keep current)"; choosing PHP 8.4 issued `PUT …/config/runtime` (200), added
+  `XMLRPC_ENABLED=true`, rolled the Deployment to `wordpress-runtime:php8.4-r1` with the existing
+  volume untouched; the site served 200 with the new headers, page cache MISS→HIT, XML-RPC reachable,
+  `wp-config.php`/`debug.log` 404, nginx access and error lines visible in the platform Logs tab.
+- **New capsule** (`runtime-test-php85-coep`, PHP 8.5, Basic plan, new storage capsule): created
+  through the wizard; Deployment on `php8.5-r1`; core copied onto the empty NFS volume; `/` → 302 to
+  the installer, installer 200, XML-RPC 403. **Defect**: the TCP startup probe killed the first
+  container mid-copy (fixed in r2 with the 503 holding page; see the plan revisions).
+- **Platform gaps found**: no database creation on the MySQL capsule (second site cannot install);
+  storage capsule shareable with no subPath (two sites, one docroot); Basic plan 0.28GB → 2 FPM
+  workers; test cluster NAT hides visitor IPs; php-fpm's own access log duplicates nginx's lines
+  (drop it in a later revision).
+
 ## 7. Test evidence
 
 - capsule-api `npm run test:unit`: 870 passing.
@@ -171,6 +190,7 @@ deploys, editable PHP/FPM/nginx config, logs in the platform viewer.
 | php8.4-r1 | ok | 27/27 |
 | php8.3-r1 | ok | 27/27 |
 | php8.5-r1 | ok | 27/27 |
+| php8.3-r2 / php8.4-r2 / php8.5-r2 (holding page) | ok, pushed | 28/28 each |
 
 (The first 8.4 run exposed a `pipefail` + `docker logs | grep -q` race in the smoke script itself,
 now fixed; the images were unaffected.)

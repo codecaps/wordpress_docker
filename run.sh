@@ -56,9 +56,17 @@ _shutdown() {
 # The upstream image's STOPSIGNAL is QUIT; the Dockerfile sets TERM. Handle all of them.
 trap '_shutdown 0' TERM INT QUIT
 
-# php-fpm first: the upstream entrypoint copies WordPress core into an empty volume before it
-# starts listening, and nginx must not accept traffic (or pass a TCP readiness probe) until FPM
-# can answer. Readiness is read from /proc, which makes no connection and leaves no log noise.
+# Startup order. nginx comes up first so the pod's TCP probes pass and visitors get a 503 "starting
+# up" page (default.conf, flag file below) instead of connection refused; php-fpm starts next, and
+# on a first boot the upstream entrypoint copies WordPress core onto the (network) volume before it
+# listens, which can take a minute. The flag is removed the moment FPM listens; until then every
+# request, /healthz included, is a 503 with Retry-After, so HTTP probes stay honest.
+STARTING_FLAG="$STATE_DIR/starting"
+touch "$STARTING_FLAG"
+
+nginx -g 'daemon off;' &
+NGINX_PID=$!
+
 docker-entrypoint.sh php-fpm &
 FPM_PID=$!
 
@@ -66,24 +74,22 @@ fpm_listening() {
     # 0100007F:2328 = 127.0.0.1:9000, state 0A = LISTEN
     grep -qE '^\s*[0-9]+: 0100007F:2328 0{8}:0000 0A ' /proc/net/tcp 2>/dev/null
 }
-echo "[run] waiting for php-fpm on 127.0.0.1:9000"
+echo "[run] waiting for php-fpm on 127.0.0.1:9000 (serving the starting page meanwhile)"
 fpm_wait_started=$SECONDS
 until fpm_listening; do
     if ! kill -0 "$FPM_PID" 2>/dev/null; then
         wait "$FPM_PID" || status=$?
         echo "[run] php-fpm exited during startup (status ${status:-?})" >&2
-        exit "${status:-1}"
+        _shutdown "${status:-1}"
     fi
     if [ $(( SECONDS - fpm_wait_started )) -ge "${FPM_STARTUP_TIMEOUT_SECONDS:-600}" ]; then
-        echo "[run] php-fpm is not listening after ${FPM_STARTUP_TIMEOUT_SECONDS:-600}s; starting nginx anyway" >&2
+        echo "[run] php-fpm is not listening after ${FPM_STARTUP_TIMEOUT_SECONDS:-600}s; removing the starting page anyway" >&2
         break
     fi
     sleep 0.5
 done
+rm -f "$STARTING_FLAG"
 echo "[run] php-fpm ready after $(( SECONDS - fpm_wait_started ))s"
-
-nginx -g 'daemon off;' &
-NGINX_PID=$!
 
 # The exporters need no privileges: run them as www-data.
 setpriv --reuid=www-data --regid=www-data --clear-groups \

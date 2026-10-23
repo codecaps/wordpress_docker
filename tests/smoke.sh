@@ -121,6 +121,20 @@ code="$(wait_http "$N-wp" /wp-admin/install.php)"
 if [ "$code" = 200 ]; then pass install; else fail install "HTTP ${code}"; fi
 PORT="$(port_of "$N-wp")"
 
+# starting-page: while run.sh's starting flag exists, every request is a 503 with Retry-After and the
+# holding page; once it is gone the site answers again (the flag is what covers a slow first boot).
+docker exec "$N-wp" touch /var/run/wp-runtime/starting
+h="$(headers_of "$N-wp" /wp-admin/install.php)"
+body="$(curl -s "http://127.0.0.1:${PORT}/healthz")"
+docker exec "$N-wp" rm -f /var/run/wp-runtime/starting
+after="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/wp-admin/install.php")"
+if grep -q '^HTTP/1.1 503' <<<"$h" && [ "$(header_value Retry-After <<<"$h")" = 5 ] \
+        && grep -q 'starting up' <<<"$body" && [ "$after" = 200 ]; then
+    pass starting-page
+else
+    fail starting-page "$(grep -E '^HTTP|^Retry' <<<"$h" | tr '\n' ' ') after=${after}"
+fi
+
 # fpm-loopback: PHP-FPM must not be reachable from the pod network.
 tcp="$(docker exec "$N-wp" cat /proc/net/tcp /proc/net/tcp6 2>/dev/null)"
 if grep -qE ' 0100007F:2328 0{8}:0000 0A ' <<<"$tcp" && ! grep -qE ' 0{8}:2328 0{8}:0000 0A | 0{32}:2328 0{32}:0000 0A ' <<<"$tcp"; then

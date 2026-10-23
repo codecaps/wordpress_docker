@@ -72,11 +72,16 @@ in the `Dockerfile`; bump the `ARG`s together with the published checksums.
 2. Writes the PHP-FPM pool config (sized to the container's cgroup limits + `$WORDPRESS_FPM_CONF`) to `/usr/local/etc/php-fpm.d/zzz-custom.conf`
 3. Generates nginx config fragments from environment variables (rate limits, cache, headers, ...)
 4. Validates the configuration with `nginx -t`. A broken `NGINX_EXTRA_CONF` is disabled (and logged) instead of crash-looping the pod.
-5. Starts php-fpm and waits until it listens (on first boot the upstream entrypoint copies WordPress core into the empty volume first), **then** starts nginx, the Prometheus exporters (as `www-data`) and the internal wp-cron trigger
+5. Starts nginx immediately with a "starting up" holding page (HTTP 503 + `Retry-After: 5` on every
+   path, `/healthz` included), then php-fpm; on a first boot the upstream entrypoint copies WordPress
+   core onto the volume before FPM listens, which can take a minute on a network volume. The holding
+   page is dropped the moment FPM listens. TCP probes therefore pass at once (no startup-probe kill
+   during the copy) and HTTP probes stay honest. The exporters run as `www-data`; the internal
+   wp-cron trigger starts last
 6. On `SIGTERM`/`SIGQUIT` shuts nginx and php-fpm down gracefully (in-flight requests finish, bounded by `SHUTDOWN_TIMEOUT_SECONDS`, default 20) and exits 0; exits non-zero if nginx or php-fpm dies
 
-`/healthz` is answered by PHP-FPM's ping path, so it fails when FPM is down. Because nginx only
-starts once FPM listens, a TCP probe on port 80 is also only green when PHP can answer.
+`/healthz` is answered by PHP-FPM's ping path, so it fails when FPM is down, and returns 503 while
+the holding page is up.
 
 nginx access and error logs, php-fpm logs and the slow log all go to the container's stdout/stderr,
 i.e. the platform log viewer. Nothing is written to log files inside the container.
@@ -271,6 +276,7 @@ warning if the fetch fails). Rebuild the image to refresh them.
 | `HSTS_HEADER` | `max-age=31536000` | `Strict-Transport-Security` value, sent only on HTTPS requests. Empty string disables it. Add `; includeSubDomains` yourself only if every subdomain of the domain is HTTPS. |
 | `NGINX_WORKER_PROCESSES` | from the CPU quota (1–4) | nginx worker count. |
 | `SHUTDOWN_TIMEOUT_SECONDS` | `20` | How long a graceful shutdown waits for in-flight requests before terminating nginx/php-fpm. |
+| `FPM_STARTUP_TIMEOUT_SECONDS` | `600` | How long the holding page is served while waiting for php-fpm to listen on a slow first boot. |
 
 Default CSP:
 ```
@@ -410,7 +416,7 @@ site defines itself.
 - **Sensitive files blocked** (404): `wp-config.*`, dumps and backups (`.sql`, `.bak`, `.old`...), `debug.log`, `.env`, `.git`, readme/changelog files
 - **Rate limiting**: four configurable zones (public, wp-admin, login/comments/xmlrpc, REST) plus a per-IP connection limit, keyed on the real client IP behind Traefik/Cloudflare
 - **Cloudflare-aware real IP**: edge ranges baked at build so XFF recursion resolves the true visitor IP
-- **Graceful deploys**: nginx waits for PHP-FPM before accepting traffic; shutdown finishes in-flight requests
+- **Graceful deploys**: a 503 holding page while PHP-FPM starts (no 502s, no probe kills on first boot); shutdown finishes in-flight requests
 - **Logs in the platform**: nginx and PHP logs on stdout/stderr
 - **Prometheus metrics**: in-container nginx and PHP-FPM exporters plus WordPress metrics
 - **WP-CLI** in the image
