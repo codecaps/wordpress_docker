@@ -178,6 +178,20 @@ the site was run locally against the test platform and exercised in Chrome (spac
   workers (r3 raises the floor to 3 from measured usage); test cluster NAT hides visitor IPs;
   php-fpm's own access log duplicated nginx's lines (off in r3).
 
+### Follow-through on cc-proxmox (same day)
+
+- capsule-api `b68dcbb6` (database creation) and `ef933fbf` (r3 tags) deployed to `capsule-api` on
+  cc-proxmox; 876 unit tests pass.
+- Database creation verified through the UI: changing the test capsule's database name to a
+  non-existent `runtime_test_php85_v2` and saving created the database on the MySQL capsule during
+  the redeploy, and the installer loaded against it.
+- Both test capsules were redeployed through the config card (PHP version changes) and now run
+  `wordpress-runtime:php8.4-r3`: pool of 3 workers on the 0.28GB plan, FPM on loopback, single
+  access-log stream, `/` 200 (legacy site) and 302 → installer (new site), no restarts.
+- The config card's PHP dropdown needed element-level clicks in the automated browser (coordinate
+  clicks on options did not register there, while they did in the create wizard) — worth a manual
+  check that the ng-select in `wordpress-config.component` behaves normally for real users.
+
 ## 7. Test evidence
 
 - capsule-api `npm run test:unit`: 870 passing.
