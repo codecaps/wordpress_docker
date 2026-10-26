@@ -1,0 +1,11 @@
+.git
+.github
+.gitignore
+*.md
+specs
+docs
+legacy
+tracks
+tests
+git
+renovate.json
