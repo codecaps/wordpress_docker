@@ -40,22 +40,48 @@ if (PHP_SAPI !== 'cli'
 
     // Constants the site defines itself (wp-config.php, or WORDPRESS_CONFIG_EXTRA which the
     // official wp-config-docker.php eval()s at runtime). Ours are only defaults for the rest.
-    $owned   = [];
-    $sources = [(string) getenv('WORDPRESS_CONFIG_EXTRA')];
+    $definedIn = static function (string $source): array {
+        $names = [];
+        if ($source !== '' && preg_match_all('/define\s*\(\s*[\'"]([A-Za-z0-9_]+)[\'"]/', $source, $matches)) {
+            foreach ($matches[1] as $name) {
+                $names[] = strtoupper($name);
+            }
+        }
+        return $names;
+    };
+    // wp-config.php sits on the capsule's (network) volume and this runs before every request, so
+    // its names are cached on local disk, keyed on the file's identity and mtime: a request costs
+    // one stat of the volume instead of a read. The cache is data (JSON), never included, so a
+    // file planted in /tmp can at most change which of these defaults get skipped.
+    $definedInFile = static function (string $file) use ($definedIn): array {
+        // is_file() first: it never raises a warning for a missing file, while a suppressed stat()
+        // warning would still show up in error_get_last() for the rest of the request.
+        if (!@is_file($file) || ($stat = @stat($file)) === false) {
+            return [];
+        }
+        $cache = sys_get_temp_dir() . '/cc-runtime-defines-'
+            . md5($file . '|' . $stat['dev'] . '|' . $stat['ino'] . '|' . $stat['mtime'] . '|' . $stat['size']) . '.json';
+        $cached = @is_file($cache) ? @file_get_contents($cache) : false;
+        if ($cached !== false && is_array($names = json_decode($cached, true))) {
+            return $names;
+        }
+        $source = @file_get_contents($file);
+        if ($source === false) {
+            return [];
+        }
+        $names = $definedIn($source);
+        $tmp   = $cache . '.' . getmypid();
+        if (@file_put_contents($tmp, json_encode($names)) !== false && !@rename($tmp, $cache)) {
+            @unlink($tmp);
+        }
+        return $names;
+    };
     $docroot = isset($_SERVER['DOCUMENT_ROOT']) && $_SERVER['DOCUMENT_ROOT'] !== ''
         ? rtrim((string) $_SERVER['DOCUMENT_ROOT'], '/')
         : '/var/www/html';
+    $owned = array_fill_keys($definedIn((string) getenv('WORDPRESS_CONFIG_EXTRA')), true);
     foreach (array_unique([$docroot . '/wp-config.php', dirname($docroot) . '/wp-config.php']) as $file) {
-        if (@is_file($file) && @is_readable($file)) {
-            $sources[] = (string) @file_get_contents($file);
-        }
-    }
-    foreach ($sources as $source) {
-        if ($source !== '' && preg_match_all('/define\s*\(\s*[\'"]([A-Za-z0-9_]+)[\'"]/', $source, $matches)) {
-            foreach ($matches[1] as $name) {
-                $owned[strtoupper($name)] = true;
-            }
-        }
+        $owned += array_fill_keys($definedInFile($file), true);
     }
     $define = static function (string $name, $value) use ($owned): void {
         if (!defined($name) && !isset($owned[$name])) {
@@ -116,6 +142,22 @@ if (PHP_SAPI !== 'cli'
         $define('WP_REDIS_TIMEOUT', 1);
         $define('WP_REDIS_READ_TIMEOUT', 1);
     }
+
+    // Cron heartbeat (read by wp-metrics.php): written when wp-cron.php's dispatcher reaches its
+    // event list, which happens only after WordPress fully loaded for the requested site. The
+    // trigger's HTTP status cannot say that: wp-cron.php answers before WordPress loads, so a site
+    // that redirects or aborts the request still returned 200. Pre-initialised like the mu-plugin
+    // hook below, so it works with WP_RUNTIME_MU_PLUGIN_ENABLED=false too.
+    $heartbeat = '/var/run/wp-runtime/cron-last-run';
+    $GLOBALS['wp_filter']['pre_get_ready_cron_jobs'][10][] = [
+        'function'      => static function ($pre) use ($heartbeat) {
+            if (function_exists('wp_doing_cron') && wp_doing_cron() && @is_writable($heartbeat)) {
+                @file_put_contents($heartbeat, time() . "\n");
+            }
+            return $pre;
+        },
+        'accepted_args' => 1,
+    ];
 
     $plugin = '/usr/share/wp-runtime/mu-plugins/code-capsules.php';
     if (!$falsy($env('WP_RUNTIME_MU_PLUGIN_ENABLED', 'true')) && is_file($plugin)) {

@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # Pushes both tags produced by ./build.sh <minor>: the immutable php<minor>-r<REVISION> tag first,
 # then the moving php<minor> alias. Refuses to overwrite an immutable tag that already exists
-# (bump REVISION in tracks/php<minor>.env instead), and refuses a local image whose PHP is older
-# than the track's MIN_PHP_VERSION (e.g. one built with a MIN_PHP_VERSION override).
+# (bump REVISION in tracks/php<minor>.env instead), refuses when the registry cannot say whether it
+# exists (an expired login must not turn into an overwrite), and refuses a local image whose PHP is
+# older than the track's MIN_PHP_VERSION (e.g. one built with a MIN_PHP_VERSION override).
 # Usage: ./push.sh 8.4
 set -euo pipefail
 cd "$(dirname "$0")"
+# shellcheck source=./tools/registry_guard.sh
+source tools/registry_guard.sh
 
 MINOR="${1:?usage: $0 <php-minor>}"
 TRACK="tracks/php${MINOR}.env"
@@ -25,10 +28,13 @@ if ! docker run --rm --platform linux/amd64 --entrypoint php "${REF}" \
     exit 1
 fi
 
-if docker buildx imagetools inspect "${REF}" >/dev/null 2>&1; then
-    echo "tag already exists: ${REF} (bump REVISION in ${TRACK})" >&2
-    exit 1
-fi
+state=0
+registry_tag_state "${REF}" || state=$?
+case "$state" in
+    0) ;;
+    1) echo "tag already exists: ${REF} (bump REVISION in ${TRACK})" >&2; exit 1 ;;
+    *) exit 1 ;;
+esac
 
 docker push "${REF}"
 docker push "${IMAGE}:php${MINOR}"

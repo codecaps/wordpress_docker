@@ -9,6 +9,13 @@ mkdir -p "$STATE_DIR"
 chown root:www-data "$STATE_DIR"
 chmod 750 "$STATE_DIR"
 
+# The cron heartbeat: written by PHP (runtime/prepend.php) each time WordPress's cron dispatcher
+# really runs, read by wp-metrics.php. www-data may write this one file, not the directory.
+CRON_HEARTBEAT_FILE="$STATE_DIR/cron-last-run"
+: > "$CRON_HEARTBEAT_FILE"
+chown www-data:www-data "$CRON_HEARTBEAT_FILE"
+chmod 644 "$CRON_HEARTBEAT_FILE"
+
 # Size PHP, PHP-FPM and nginx to this container's cgroup limits once, export the result for the
 # configure scripts below (and, through php-fpm's clear_env=no, to PHP: wp-metrics reports it),
 # and log it so the effective sizing is visible on every boot.
@@ -118,49 +125,81 @@ FPM_EXP_PID=$!
 # loop is what runs cron. On by default; set WP_CRON_TRIGGER_ENABLED=false only if the capsule
 # triggers cron some other way. Tune the interval with WP_CRON_TRIGGER_INTERVAL_SECONDS
 # (default 60: WooCommerce's Action Scheduler and most schedulers expect a minute).
+#
+# Each run triggers every site WordPress reports (its own host, path and scheme, so multisite
+# networks and HTTPS-only sites run their cron), at most WP_CRON_TRIGGER_SITES_PER_RUN of them
+# (default 3, rotating through a larger network); the list is refreshed every
+# WP_CRON_TRIGGER_TARGETS_REFRESH_SECONDS (default 3600). See scripts/lib/wp_cron_trigger.sh.
 wp_cron_trigger_enabled="${WP_CRON_TRIGGER_ENABLED:-true}"
 
 # Validation matches validated_positive_int() in scripts/lib/runtime_env.sh (min 1, fallback on
 # anything non-numeric). Without it, a bad value makes `sleep` fail: under `set -e` that would
 # silently kill the loop for good (0 would instead spin it tight enough to exhaust FPM workers).
-wp_cron_trigger_interval="${WP_CRON_TRIGGER_INTERVAL_SECONDS:-60}"
-if ! [[ "$wp_cron_trigger_interval" =~ ^[0-9]+$ ]] || [ "$wp_cron_trigger_interval" -lt 1 ]; then
-    echo "[wp-cron-trigger] Invalid WP_CRON_TRIGGER_INTERVAL_SECONDS value '${wp_cron_trigger_interval}'. Falling back to 60." >&2
-    wp_cron_trigger_interval=60
-fi
-echo "[run]   wp_cron_trigger_enabled=${wp_cron_trigger_enabled}, wp_cron_trigger_interval_seconds=${wp_cron_trigger_interval}"
+_wp_cron_positive_int() {
+    local name="$1" value="$2" fallback="$3"
+    if [[ "$value" =~ ^[0-9]{1,9}$ ]] && [ "$value" -ge 1 ]; then
+        echo "$value"
+        return
+    fi
+    echo "[wp-cron-trigger] Invalid ${name} value '${value}'. Falling back to ${fallback}." >&2
+    echo "$fallback"
+}
+wp_cron_trigger_interval="$(_wp_cron_positive_int WP_CRON_TRIGGER_INTERVAL_SECONDS "${WP_CRON_TRIGGER_INTERVAL_SECONDS:-60}" 60)"
+wp_cron_trigger_sites_per_run="$(_wp_cron_positive_int WP_CRON_TRIGGER_SITES_PER_RUN "${WP_CRON_TRIGGER_SITES_PER_RUN:-3}" 3)"
+wp_cron_trigger_refresh="$(_wp_cron_positive_int WP_CRON_TRIGGER_TARGETS_REFRESH_SECONDS "${WP_CRON_TRIGGER_TARGETS_REFRESH_SECONDS:-3600}" 3600)"
+echo "[run]   wp_cron_trigger_enabled=${wp_cron_trigger_enabled}, wp_cron_trigger_interval_seconds=${wp_cron_trigger_interval}, sites_per_run=${wp_cron_trigger_sites_per_run}"
 
 if [[ "${wp_cron_trigger_enabled,,}" =~ ^(true|1|yes|on)$ ]]; then
     echo "[wp-cron-trigger] internal trigger loop starting (interval=${wp_cron_trigger_interval}s)"
     (
         # Deliberately not strict: this loop must survive for the life of the container on
-        # nothing but a validated interval, a curl call whose failure is handled below, and a
-        # `sleep` that can only be interrupted by the TERM trap.
+        # nothing but validated numbers, WP-CLI and curl calls whose failures are handled below,
+        # and a `sleep` that can only be interrupted by the TERM trap.
         set +e
         trap 'kill -TERM "${SLEEP_PID:-}" 2>/dev/null; exit 0' TERM
-        # Written on every successful trigger; read by wp-metrics.php as
-        # wp_cron_trigger_last_success_timestamp_seconds.
-        wp_cron_trigger_heartbeat_file="/var/run/wp-cron-trigger-last-success"
-        last_heartbeat_log=0
+        # shellcheck source=./scripts/lib/wp_cron_trigger.sh
+        source "$RUN_DIR/scripts/lib/wp_cron_trigger.sh"
+        WP_CRON_TRIGGER_TARGETS=()
+        WP_CRON_TRIGGER_EXPIRES=0
+        offset=0
+        logged_targets=""
         # nginx was started a moment ago; give it a beat before the first trigger.
         sleep 2
         while true; do
-            # wp-cron.php calls fastcgi_finish_request() and closes the connection before doing
-            # any real work, so this returns in milliseconds regardless of how long the cron
-            # callbacks run afterwards in the detached FPM worker.
-            if curl -fsS --max-time 30 -H "Host: 127.0.0.1" \
-                    "http://127.0.0.1/wp-cron.php?doing_wp_cron" >/dev/null; then
-                now=$(date +%s)
-                printf '%s\n' "$now" > "$wp_cron_trigger_heartbeat_file" 2>/dev/null \
-                    && chmod 644 "$wp_cron_trigger_heartbeat_file" 2>/dev/null
-                # Log on success too, but throttled to hourly.
-                if [ $(( now - last_heartbeat_log )) -ge 3600 ]; then
-                    echo "[wp-cron-trigger] heartbeat: trigger succeeded at $(date -u +%FT%TZ)"
-                    last_heartbeat_log=$now
+            wp_cron_trigger_refresh "$(date +%s)" "$wp_cron_trigger_refresh"
+            n="${#WP_CRON_TRIGGER_TARGETS[@]}"
+            if [ "${WP_CRON_TRIGGER_TARGETS[*]}" != "$logged_targets" ]; then
+                logged_targets="${WP_CRON_TRIGGER_TARGETS[*]}"
+                if [ "$WP_CRON_TRIGGER_FALLBACK" = 1 ]; then
+                    echo "[wp-cron-trigger] WordPress did not report its site URLs (not installed yet, or the database is unreachable); triggering http://127.0.0.1/ and asking again within 5 minutes"
+                else
+                    shown=""
+                    for (( i = 0; i < n && i < 5; i++ )); do
+                        shown="${shown} $(wp_cron_trigger_url "${WP_CRON_TRIGGER_TARGETS[$i]}")"
+                    done
+                    [ "$n" -gt 5 ] && shown="${shown} (+$(( n - 5 )) more)"
+                    echo "[wp-cron-trigger] ${n} site(s), up to ${wp_cron_trigger_sites_per_run} per run:${shown}"
+                    cycle_runs="$(wp_cron_trigger_cycle_runs "$n" "$wp_cron_trigger_sites_per_run")"
+                    if [ "$cycle_runs" -gt 1 ]; then
+                        cycle_seconds=$(( cycle_runs * wp_cron_trigger_interval ))
+                        if [ "$cycle_seconds" -gt 3600 ]; then
+                            echo "[wp-cron-trigger] WARNING: each site's cron runs only every ${cycle_seconds}s (${cycle_runs} runs of ${wp_cron_trigger_interval}s); raise WP_CRON_TRIGGER_SITES_PER_RUN for a network this size" >&2
+                        else
+                            echo "[wp-cron-trigger] each site is triggered every ${cycle_runs} runs (${cycle_seconds}s)"
+                        fi
+                    fi
                 fi
-            else
-                echo "[wp-cron-trigger] trigger failed" >&2
             fi
+            # wp-cron.php calls fastcgi_finish_request() and closes the connection before doing
+            # any real work, so each request returns in milliseconds regardless of how long the
+            # cron callbacks run afterwards in the detached FPM worker. Its status only says nginx
+            # and PHP-FPM took the request; the heartbeat says whether cron ran.
+            for i in $(wp_cron_trigger_batch "$n" "$wp_cron_trigger_sites_per_run" "$offset"); do
+                if ! wp_cron_trigger_fire "${WP_CRON_TRIGGER_TARGETS[$i]}"; then
+                    echo "[wp-cron-trigger] trigger failed for $(wp_cron_trigger_url "${WP_CRON_TRIGGER_TARGETS[$i]}")" >&2
+                fi
+            done
+            [ "$n" -gt 0 ] && offset=$(( (offset + wp_cron_trigger_sites_per_run) % n ))
             sleep "$wp_cron_trigger_interval" &
             SLEEP_PID=$!
             wait "$SLEEP_PID"

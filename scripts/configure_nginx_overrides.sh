@@ -56,22 +56,8 @@ validated_header_value() {
         echo "$value"
         return
     fi
-    log "Invalid ${var_name} value (only letters, digits, space and ' * : ; / . , _ = + ~ ! % @ - are allowed). Falling back to the default."
+    log "Invalid ${var_name} value (only letters, digits, space and ' * : ; / . , _ = + ~ ! % @ - are allowed). Falling back to the default." >&2
     echo "$fallback"
-}
-
-validated_cidrs() {
-    local raw="$1" fallback="$2" var_name="$3" out="" cidr
-    for cidr in ${raw//,/ }; do
-        if [[ "$cidr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]] || [[ "$cidr" =~ ^[0-9A-Fa-f:]+(/[0-9]+)?$ ]]; then
-            out="${out}${cidr} "
-        else
-            log "Invalid ${var_name} entry '${cidr}'. Falling back to the default list."
-            echo "$fallback"
-            return
-        fi
-    done
-    echo "${out% }"
 }
 
 pattern_to_name_regex() {
@@ -240,7 +226,8 @@ normal_routes_rpm="$(validated_positive_int "${RATE_LIMIT_NORMAL_ROUTES_RPM:-$DE
 protected_routes_rpm="$(validated_positive_int "${RATE_LIMIT_PROTECTED_ROUTES_RPM:-$DEFAULT_RATE_LIMIT_PROTECTED_ROUTES_RPM}" "$DEFAULT_RATE_LIMIT_PROTECTED_ROUTES_RPM" "RATE_LIMIT_PROTECTED_ROUTES_RPM")"
 login_routes_rpm="$(validated_positive_int "${RATE_LIMIT_LOGIN_ROUTES_RPM:-$DEFAULT_RATE_LIMIT_LOGIN_ROUTES_RPM}" "$DEFAULT_RATE_LIMIT_LOGIN_ROUTES_RPM" "RATE_LIMIT_LOGIN_ROUTES_RPM")"
 api_routes_rpm="$(validated_positive_int "${RATE_LIMIT_API_ROUTES_RPM:-$DEFAULT_RATE_LIMIT_API_ROUTES_RPM}" "$DEFAULT_RATE_LIMIT_API_ROUTES_RPM" "RATE_LIMIT_API_ROUTES_RPM")"
-max_conn_per_ip="$(validated_positive_int "${RATE_LIMIT_MAX_CONN_PER_IP:-$DEFAULT_RATE_LIMIT_MAX_CONN_PER_IP}" "$DEFAULT_RATE_LIMIT_MAX_CONN_PER_IP" "RATE_LIMIT_MAX_CONN_PER_IP")"
+# nginx's limit_conn refuses 65536 and above.
+max_conn_per_ip="$(validated_positive_int "${RATE_LIMIT_MAX_CONN_PER_IP:-$DEFAULT_RATE_LIMIT_MAX_CONN_PER_IP}" "$DEFAULT_RATE_LIMIT_MAX_CONN_PER_IP" "RATE_LIMIT_MAX_CONN_PER_IP" 65535)"
 max_upload_size="$(validated_upload_size "${MAX_UPLOAD_SIZE:-$DEFAULT_MAX_UPLOAD_SIZE}" "$DEFAULT_MAX_UPLOAD_SIZE" "MAX_UPLOAD_SIZE")"
 cache_max_size="$(validated_upload_size "${CACHE_MAX_SIZE:-$DEFAULT_CACHE_MAX_SIZE}" "$DEFAULT_CACHE_MAX_SIZE" "CACHE_MAX_SIZE")"
 
@@ -251,7 +238,8 @@ cache_max_size="$(validated_upload_size "${CACHE_MAX_SIZE:-$DEFAULT_CACHE_MAX_SI
 resource_sizing_load
 worker_processes="$CC_SIZING_NGINX_WORKERS"
 if [ -n "${NGINX_WORKER_PROCESSES:-}" ]; then
-    worker_processes="$(validated_positive_int "$NGINX_WORKER_PROCESSES" "$worker_processes" "NGINX_WORKER_PROCESSES")"
+    # nginx would happily fork 99999 workers; 64 is far past anything a capsule can use.
+    worker_processes="$(validated_positive_int "$NGINX_WORKER_PROCESSES" "$worker_processes" "NGINX_WORKER_PROCESSES" 64)"
 fi
 
 # --- Cache and TTL ---
@@ -263,7 +251,7 @@ cache_ttl_raw="${CACHE_TTL_SECONDS:-$DEFAULT_CACHE_TTL_SECONDS}"
 if [[ "${cache_ttl_raw,,}" =~ ^(0|off|false|no|none|disabled)$ ]]; then
     cache_enabled="false"
     cache_ttl_seconds=""
-elif [[ "$cache_ttl_raw" =~ ^[0-9]+$ ]] && [ "$cache_ttl_raw" -ge 1 ]; then
+elif [[ "$cache_ttl_raw" =~ ^[0-9]{1,9}$ ]] && [ "$cache_ttl_raw" -ge 1 ]; then
     cache_ttl_seconds="$cache_ttl_raw"
 else
     log "Invalid CACHE_TTL_SECONDS value '${cache_ttl_raw}' (positive integer, or 0 to disable). Falling back to ${DEFAULT_CACHE_TTL_SECONDS}."
@@ -428,13 +416,11 @@ else
     write_default_cache_key
 fi
 
-# XML-RPC route (location{} context).
+# XML-RPC route (location{} context). Never cached: the location does not enable fastcgi_cache.
 if is_true "$xmlrpc_enabled_raw"; then
     cat > "$NGINX_XMLRPC_OVERRIDES_FILE" <<'EOC'
 # Auto-generated at container startup. Do not edit manually.
 include /etc/nginx/snippets/wp-fastcgi.conf;
-fastcgi_no_cache 1;
-fastcgi_cache_bypass 1;
 EOC
 else
     cat > "$NGINX_XMLRPC_OVERRIDES_FILE" <<'EOC'
@@ -443,7 +429,8 @@ return 403;
 EOC
 fi
 
-# wp-cron location block (server{} context, full location block).
+# wp-cron location block (server{} context, full location block). Never cached: the location does
+# not enable fastcgi_cache.
 if is_true "$disable_public_wp_cron_raw"; then
     cat > "$NGINX_WP_CRON_FILE" <<'EOC'
 # Auto-generated at container startup. Do not edit manually.
@@ -454,8 +441,6 @@ location = /wp-cron.php {
     deny all;
     set $php_upstream php_fpm_internal;
     include /etc/nginx/snippets/wp-fastcgi.conf;
-    fastcgi_no_cache 1;
-    fastcgi_cache_bypass 1;
 }
 EOC
 else
@@ -468,8 +453,6 @@ location = /wp-cron.php {
     limit_req zone=login_routes burst=3 nodelay;
     set $php_upstream $cc_loopback_php_upstream;
     include /etc/nginx/snippets/wp-fastcgi.conf;
-    fastcgi_no_cache 1;
-    fastcgi_cache_bypass 1;
 }
 EOC
 fi
