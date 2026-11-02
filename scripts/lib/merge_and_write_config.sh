@@ -67,7 +67,9 @@ merge_and_write_config() {
             return lhs
         }
 
-        NR == FNR {
+        # First file = the overrides. (Not the usual NR == FNR: with an empty override file that
+        # idiom stays true for the defaults too, which then lost every comment and blank line.)
+        FILENAME == ARGV[1] {
             line = $0
             sub(/\r$/, "", line)
             override_lines[++override_count] = line

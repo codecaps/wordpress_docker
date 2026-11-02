@@ -8,7 +8,8 @@
  *  1. Tells PHP the request was HTTPS when Traefik says so (X-Forwarded-Proto), so `is_ssl()` is
  *     right even for git capsules whose wp-config.php lacks the proxy shim.
  *  2. Defines hardened defaults for a few wp-config constants the site has not defined itself
- *     (DISABLE_WP_CRON, DISALLOW_FILE_EDIT, WP_MEMORY_LIMIT, WP_MAX_MEMORY_LIMIT, WP_REDIS_*).
+ *     (DISABLE_WP_CRON, DISALLOW_FILE_EDIT, WP_MEMORY_LIMIT and WP_MAX_MEMORY_LIMIT from the
+ *     container-sized php.ini memory_limit, WP_REDIS_*).
  *     A constant the owner defines in wp-config.php or WORDPRESS_CONFIG_EXTRA always wins: those
  *     names are detected and skipped, so there is never an "already defined" warning.
  *  3. Loads the runtime mu-plugin (/usr/share/wp-runtime/mu-plugins/code-capsules.php) through a
@@ -74,10 +75,28 @@ if (PHP_SAPI !== 'cli'
     // docroot. Off by default like every managed WordPress host; WP_DISALLOW_FILE_EDIT=false re-enables.
     $define('DISALLOW_FILE_EDIT', !$falsy($env('WP_DISALLOW_FILE_EDIT', 'true')));
 
-    // WordPress's own default is 40M, which modern plugins exceed. PHP memory_limit (256M) caps the
-    // admin value; WordPress raises its limit with ini_set when allowed.
-    $define('WP_MEMORY_LIMIT', $env('WP_MEMORY_LIMIT', '256M'));
-    $define('WP_MAX_MEMORY_LIMIT', $env('WP_MAX_MEMORY_LIMIT', '512M'));
+    // WordPress raises memory_limit to WP_MEMORY_LIMIT whenever that is higher, which would defeat
+    // the per-request cap the runtime sized to the container (zz-custom.ini: 128M below 1.5G of
+    // memory, 256M above). So WP_MEMORY_LIMIT defaults to that sized value (WordPress's own
+    // default is 40M, which modern plugins exceed). WP_MAX_MEMORY_LIMIT, which WordPress uses for
+    // admin work, image editing and upgrades, comes from the sizing too (CC_SIZING_* reach PHP
+    // through php-fpm's clear_env = no): twice the request limit where the container can hold it;
+    // without the sizing in the environment (the CLI), twice the limit and at least 256M.
+    $limitMb = 256;
+    if (preg_match('/^\s*(\d+)\s*([KMG]?)\s*$/i', (string) ini_get('memory_limit'), $m) && (int) $m[1] > 0) {
+        $limitMb = max(1, match (strtoupper($m[2])) {
+            'G'     => (int) $m[1] * 1024,
+            'M'     => (int) $m[1],
+            'K'     => intdiv((int) $m[1], 1024),
+            default => intdiv((int) $m[1], 1024 * 1024),
+        });
+    }
+    $sizedMax = $env('CC_SIZING_WP_MAX_MEMORY_LIMIT_MB');
+    $maxMb    = ($sizedMax !== null && ctype_digit($sizedMax) && (int) $sizedMax > 0)
+        ? (int) $sizedMax
+        : max(256, 2 * $limitMb);
+    $define('WP_MEMORY_LIMIT', $env('WP_MEMORY_LIMIT', $limitMb . 'M'));
+    $define('WP_MAX_MEMORY_LIMIT', $env('WP_MAX_MEMORY_LIMIT', $maxMb . 'M'));
 
     // Redis object cache: when a Redis host is given, the Redis Cache plugin's constants are set
     // from env so enabling the plugin is the only remaining step. PhpRedis is compiled into the image.

@@ -19,7 +19,7 @@ pass() { echo "PASS $1"; }
 fail() { echo "FAIL $1${2:+: $2}"; FAILED=1; }
 
 cleanup() {
-    docker rm -f "$N-wp" "$N-wp2" "$N-wp3" "$N-git" "$N-db" >/dev/null 2>&1
+    docker rm -f "$N-wp" "$N-wp2" "$N-wp3" "$N-sized" "$N-pinned" "$N-git" "$N-db" >/dev/null 2>&1
     docker volume rm "$N-vol" >/dev/null 2>&1
     docker network rm "$N" >/dev/null 2>&1
     docker rmi "$GIT_IMG" >/dev/null 2>&1
@@ -42,11 +42,11 @@ run_wp() {
 
 port_of() { docker port "$1" 80 | head -1 | cut -d: -f2; }
 
-# Polls GET $2 on container $1 for up to 120s; prints the last status code.
+# Polls GET $2 on container $1 for up to 120s ($3 polls of 2s to change it); prints the last status code.
 wait_http() {
     local code=000 port
     port="$(port_of "$1")"
-    for _ in $(seq 1 60); do
+    for _ in $(seq 1 "${3:-60}"); do
         code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}$2")"
         [ "$code" = 200 ] && break
         sleep 2
@@ -183,16 +183,26 @@ else
 fi
 
 # prepend-constants: the platform prepend applies (also to the CLI) and the mu-plugin is loaded.
-consts="$(wp_cli "$N-wp" eval 'echo (DISABLE_WP_CRON ? "cron-off" : "cron-on"), " ", (DISALLOW_FILE_EDIT ? "noedit" : "edit"), " ", WP_MEMORY_LIMIT, " ", (function_exists("CodeCapsules\\Runtime\\purge_all") ? "mu-loaded" : "mu-missing");' 2>/dev/null)"
-if [ "$consts" = "cron-off noedit 256M mu-loaded" ]; then
+# WP_MEMORY_LIMIT follows the container-sized php.ini memory_limit (256M here: no cgroup limit, so
+# the host's memory is used) and WP_MAX_MEMORY_LIMIT is twice it.
+consts="$(wp_cli "$N-wp" eval 'echo (DISABLE_WP_CRON ? "cron-off" : "cron-on"), " ", (DISALLOW_FILE_EDIT ? "noedit" : "edit"), " ", WP_MEMORY_LIMIT, "/", WP_MAX_MEMORY_LIMIT, " ", (function_exists("CodeCapsules\\Runtime\\purge_all") ? "mu-loaded" : "mu-missing");' 2>/dev/null)"
+php_limit="$(docker exec "$N-wp" php -r 'echo ini_get("memory_limit");')"
+if [ "$consts" = "cron-off noedit ${php_limit}/$(( 2 * ${php_limit%M} ))M mu-loaded" ]; then
     pass prepend-constants
 else
     fail prepend-constants "'${consts}'"
 fi
 
 # prepend-respects-owner: a constant the owner defines in WORDPRESS_CONFIG_EXTRA is left alone.
-owner="$(docker exec -e "WORDPRESS_CONFIG_EXTRA=define('WP_MEMORY_LIMIT', '96M');" "$N-wp" php -r 'echo defined("WP_MEMORY_LIMIT") ? "defined" : "skipped";')"
-if [ "$owner" = "skipped" ]; then pass prepend-respects-owner; else fail prepend-respects-owner "$owner"; fi
+# (`php -r` does not run auto_prepend_file, so the prepend is required explicitly; the control
+# run without the owner's define proves the check can see the constant at all.)
+owner="$(docker exec -e "WORDPRESS_CONFIG_EXTRA=define('WP_MEMORY_LIMIT', '96M');" "$N-wp" php -r 'require "/usr/share/wp-runtime/prepend.php"; echo defined("WP_MEMORY_LIMIT") ? "defined" : "skipped";')"
+control="$(docker exec "$N-wp" php -r 'require "/usr/share/wp-runtime/prepend.php"; echo defined("WP_MEMORY_LIMIT") ? "defined" : "skipped";')"
+if [ "$owner" = "skipped" ] && [ "$control" = "defined" ]; then
+    pass prepend-respects-owner
+else
+    fail prepend-respects-owner "owner=${owner} control=${control}"
+fi
 
 # cache-hit: the second anonymous GET of the front page is served from the page cache.
 curl -s -o /dev/null "http://127.0.0.1:${PORT}/"
@@ -228,6 +238,37 @@ else
     fail cache-purge-cli "wp cc cache purge did not succeed"
 fi
 
+# donotcachepage: a page WordPress marks DONOTCACHEPAGE is never stored (second view is still a
+# MISS), the marker header the mu-plugin uses does not leak to the client, and an ordinary page
+# with a query string is still cached (control).
+docker exec -i "$N-wp" bash -c 'mkdir -p /var/www/html/wp-content/mu-plugins && cat > /var/www/html/wp-content/mu-plugins/cc-smoke-nocache.php' <<'EOP'
+<?php
+add_action('template_redirect', function () {
+    if (isset($_GET['cc_smoke_nocache'])) {
+        define('DONOTCACHEPAGE', true);
+    }
+    // The SEOPress/feed pattern: define the constant and end the request at priority 10.
+    if (isset($_GET['cc_smoke_nocache_exit'])) {
+        define('DONOTCACHEPAGE', true);
+        echo 'exit-body';
+        exit;
+    }
+});
+EOP
+curl -s -o /dev/null "http://127.0.0.1:${PORT}/?cc_smoke_nocache=1"
+h="$(headers_of "$N-wp" "/?cc_smoke_nocache=1")"
+curl -s -o /dev/null "http://127.0.0.1:${PORT}/?cc_smoke_nocache_exit=1"
+hx="$(curl -s -D - "http://127.0.0.1:${PORT}/?cc_smoke_nocache_exit=1")"
+curl -s -o /dev/null "http://127.0.0.1:${PORT}/?cc_smoke_cached=1"
+control="$(headers_of "$N-wp" "/?cc_smoke_cached=1" | header_value X-Cache)"
+docker exec "$N-wp" rm -f /var/www/html/wp-content/mu-plugins/cc-smoke-nocache.php
+if [ "$(header_value X-Cache <<<"$h")" = "MISS" ] && ! grep -qi '^X-CC-No-Cache:' <<<"$h" \
+        && [ "$(header_value X-Cache <<<"$hx")" = "MISS" ] && grep -q 'exit-body' <<<"$hx" && [ "$control" = "HIT" ]; then
+    pass donotcachepage
+else
+    fail donotcachepage "nocache=$(header_value X-Cache <<<"$h") marker-leaked=$(grep -ci '^X-CC-No-Cache:' <<<"$h") exit=$(header_value X-Cache <<<"$hx") control=${control}"
+fi
+
 # rate-limit-login: wp-login.php is throttled per IP, and the 429s are visible in the logs.
 codes=""
 for _ in $(seq 1 15); do
@@ -257,22 +298,97 @@ if [ "$code" = 403 ]; then pass xmlrpc-blocked; else fail xmlrpc-blocked "HTTP $
 up="$(docker exec "$N-wp" php -r 'echo ini_parse_quantity(ini_get("upload_max_filesize")), " ", ini_parse_quantity(ini_get("post_max_size"));')"
 if [ "$up" = "67108864 67108864" ]; then pass upload-size-sync; else fail upload-size-sync "$up"; fi
 
-# metrics: served from outside the docroot, so it works with a volume over /var/www/html.
+# metrics: served from outside the docroot, so it works with a volume over /var/www/html; the
+# sizing in effect is exported too (run.sh's CC_SIZING_* reach PHP through clear_env=no).
 metrics="$(docker exec "$N-wp" curl -s 127.0.0.1:8080/wp-metrics)"
-if grep -qx 'wp_cron_trigger_enabled 1' <<<"$metrics" && grep -q '^wordpress_core_version_info{version=' <<<"$metrics"; then
+if grep -qx 'wp_cron_trigger_enabled 1' <<<"$metrics" && grep -q '^wordpress_core_version_info{version=' <<<"$metrics" \
+        && grep -qE '^cc_runtime_fpm_max_children [1-9][0-9]*$' <<<"$metrics" \
+        && grep -qE '^cc_runtime_php_max_inflight_requests [1-9][0-9]*$' <<<"$metrics" \
+        && grep -qE '^cc_runtime_php_memory_limit_bytes (134217728|268435456)$' <<<"$metrics"; then
     pass metrics
 else
-    fail metrics "$(head -c 200 <<<"$metrics")"
+    fail metrics "$(grep -E '^(cc_runtime|wp_cron_trigger_enabled|wordpress_core)' <<<"$metrics" | tr '\n' ' ' | head -c 300)"
 fi
 
-# fpm-sizing: the pool was derived from the cgroup limits (2..64 children) and listens on loopback.
+# fpm-sizing: the pool was derived from the limits (3..64 children), listens on loopback, and the
+# nginx in-flight cap follows it (4 per worker, at least 8).
 pool="$(docker exec "$N-wp" cat /usr/local/etc/php-fpm.d/zzz-custom.conf)"
 children="$(sed -n 's/^pm\.max_children = \([0-9]*\)$/\1/p' <<<"$pool")"
-if [ -n "$children" ] && [ "$children" -ge 2 ] && [ "$children" -le 64 ] && grep -qx 'listen = 127.0.0.1:9000' <<<"$pool"; then
+inflight="$(docker exec "$N-wp" sed -n 's/^    server 127.0.0.1:9000 max_conns=\([0-9]*\);$/\1/p' /etc/nginx/conf.d/generated_upstream.conf)"
+if [ -n "$children" ] && [ "$children" -ge 3 ] && [ "$children" -le 64 ] && grep -qx 'listen = 127.0.0.1:9000' <<<"$pool" \
+        && [ "$inflight" = "$(( children * 4 > 8 ? children * 4 : 8 ))" ]; then
     pass fpm-sizing
 else
-    fail fpm-sizing "pm.max_children='${children}'"
+    fail fpm-sizing "pm.max_children='${children}' inflight='${inflight}'"
 fi
+
+# sized-limits: with cgroup limits (1 GiB, 0.25 CPU) the sizing is deterministic: 3 workers, 128M
+# requests, 176M OPcache, a 12-connection cap, and (seen through php-fpm, where run.sh's exports
+# apply) WP_MEMORY_LIMIT 128M / WP_MAX_MEMORY_LIMIT 256M and ImageMagick bounded to 128/256 MiB.
+run_wp "$N-sized" "" "$IMG" --memory 1g --cpus 0.25 -e WP_CRON_TRIGGER_ENABLED=false
+wait_http "$N-sized" /healthz 150 >/dev/null
+sized_files="$(docker exec "$N-sized" bash -c '
+    sed -n "s/^pm\.max_children = //p" /usr/local/etc/php-fpm.d/zzz-custom.conf
+    sed -n "s/^    server 127.0.0.1:9000 max_conns=\([0-9]*\);$/\1/p" /etc/nginx/conf.d/generated_upstream.conf
+    sed -n "s/^memory_limit = //p" "$PHP_INI_DIR/conf.d/zz-custom.ini"
+    sed -n "s/^opcache\.memory_consumption = //p" "$PHP_INI_DIR/conf.d/zz-custom.ini"' | tr '\n' ' ')"
+docker exec -i "$N-sized" bash -c 'cat > /var/www/html/cc-smoke-env.php' <<'EOP'
+<?php
+$mb = static fn($v) => $v >= 1048576 ? intdiv((int) $v, 1048576) : (int) $v;
+echo ini_get('memory_limit'), ' ', WP_MEMORY_LIMIT, ' ', WP_MAX_MEMORY_LIMIT, ' ',
+    $mb(Imagick::getResourceLimit(Imagick::RESOURCETYPE_MEMORY)), ' ', $mb(Imagick::getResourceLimit(Imagick::RESOURCETYPE_MAP));
+EOP
+sport="$(port_of "$N-sized")"
+sized_http="$(curl -s "http://127.0.0.1:${sport}/cc-smoke-env.php")"
+sized_log="$(docker logs "$N-sized" 2>&1 | grep -c '\[sizing\] Container limits (cgroup): memory=1024M cpu=250m')"
+if [ "$sized_files" = "3 12 128M 176 " ] && [ "$sized_http" = "128M 128M 256M 128 256" ] && [ "$sized_log" = 1 ]; then
+    pass sized-limits
+else
+    fail sized-limits "files='${sized_files}' http='${sized_http}' log=${sized_log}"
+fi
+
+# inflight-cap: past the pool's connection cap nginx answers 503 + Retry-After at once instead of
+# queueing. 20 concurrent 2s requests against 3 workers and a cap of 12: the admitted ones all
+# complete (no keep-alive stall), the rest are immediate 503s with the busy page. The requests
+# bypass the page cache (?s= is a search): a cacheable URL would be rendered once and the other 19
+# served as cache HITs from behind fastcgi_cache_lock, which is exactly what the cap must not shed.
+docker exec -i "$N-sized" bash -c 'cat > /var/www/html/cc-smoke-slow.php' <<'EOP'
+<?php usleep(2000000); echo "slow";
+EOP
+codes_file="$(mktemp)"
+for _ in $(seq 1 20); do
+    curl -s -o /dev/null -w '%{http_code}\n' --max-time 60 "http://127.0.0.1:${sport}/cc-smoke-slow.php?s=1" >>"$codes_file" &
+done
+wait
+n200="$(grep -c '^200$' "$codes_file")"; n503="$(grep -c '^503$' "$codes_file")"; rm -f "$codes_file"
+busy="$(for _ in $(seq 1 14); do curl -s -o /dev/null "http://127.0.0.1:${sport}/cc-smoke-slow.php?s=1" & done; sleep 0.5; curl -s -D - "http://127.0.0.1:${sport}/cc-smoke-slow.php?s=1"; wait)"
+if [ "$n200" -ge 3 ] && [ "$n503" -ge 1 ] && [ $(( n200 + n503 )) -eq 20 ] \
+        && grep -q 'busy right now' <<<"$busy" && [ "$(header_value Retry-After <<<"$busy")" = 5 ]; then
+    pass inflight-cap
+else
+    fail inflight-cap "200=${n200} 503=${n503} busy-page=$(grep -c 'busy right now' <<<"$busy")"
+fi
+docker rm -f "$N-sized" >/dev/null
+
+# pinned-overrides: a customer pin PHP-FPM accepts (trailing comment, quoted value) is fed back
+# into the sizing and the pool starts: php-fpm -t passes, the spares follow the pinned count, the
+# worker budget follows the pinned limit, and the capacity cap follows the pool.
+run_wp "$N-pinned" "" "$IMG" --memory 1g --cpus 0.25 -e WP_CRON_TRIGGER_ENABLED=false \
+    -e WORDPRESS_FPM_CONF=$'[www]\npm.max_children = 4 ; keep it small' -e WORDPRESS_CUSTOM_INI='memory_limit = "192M"'
+code="$(wait_http "$N-pinned" /healthz 150)"
+fpm_t="$(docker exec "$N-pinned" php-fpm -t 2>&1 | tail -1)"
+plogs="$(docker logs "$N-pinned" 2>&1)"
+pinned="$(docker exec "$N-pinned" bash -c '
+    sed -n "s/^pm\.max_spare_servers = //p" /usr/local/etc/php-fpm.d/zzz-custom.conf
+    sed -n "s/^    server 127.0.0.1:9000 max_conns=\([0-9]*\);$/\1/p" /etc/nginx/conf.d/generated_upstream.conf
+    php -r "echo ini_get(\"memory_limit\");"' | tr '\n' ' ')"
+if [ "$code" = 200 ] && grep -q 'test is successful' <<<"$fpm_t" && grep -q 'pm.max_children pinned to 4' <<<"$plogs" \
+        && grep -q 'worker_budget=96M' <<<"$plogs" && [ "$pinned" = "2 16 192M" ]; then
+    pass pinned-overrides
+else
+    fail pinned-overrides "healthz=${code} fpm-t='${fpm_t}' values='${pinned}'"
+fi
+docker rm -f "$N-pinned" >/dev/null
 
 # graceful-stop: a stop finishes well inside the grace period, exits 0, and shuts down cleanly.
 start=$(date +%s)

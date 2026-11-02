@@ -351,3 +351,62 @@ slow requests (the WordPress installer calling api.wordpress.org took 41s) stall
 r3 sizes the pool as `(memory − 96M − OPcache/4) / 56M`, clamped to 3–64 (Basic plan → 3, 512Mi →
 6, 1Gi+ → 12 per CPU), and turns off php-fpm's own access log, which duplicated every nginx
 request line in the platform log viewer. `REVISION=3`; capsule-api `WORDPRESS_RUNTIME_TAGS` → `php8.x-r3`.
+
+## Revisions (2026-11-02, r4) — load-tested sizing, load shedding, keep-alive defect
+
+`wordpress_git_docker` (branch `fix/performance`) sized PHP, PHP-FPM and nginx to the capsule's
+cgroup limits after a production OOM-kill and load-tested the model with k6 on cc-proxmox and in a
+local lab (`docs/sizing-load-test-2026-10-27.md` there). r4 ports that model here, keeps this
+platform's measurements where they differ, applies what a three-lens review of the result found,
+and fixes a concurrency defect found on the way. The full comparison and the review are in
+`docs/superpowers/specs/2026-11-02-sizing-and-defaults-review.md`.
+
+- **Sizing library** (`scripts/lib/container_resources.sh`, `scripts/lib/resource_sizing.sh`):
+  memory-bound AND CPU-bound pool (millicores, 12 workers per CPU: r3 rounded 0.07 CPU up to a whole
+  core and allowed 12 workers on Premium), `memory_limit` 128M below 1.5 GiB / 256M above,
+  `WP_MAX_MEMORY_LIMIT` sized (128M Basic, 256M Standard/Premium, 512M from 2 GiB), OPcache
+  `clamp(mem/6, 96, 256)`, spares derived, floor 3 (r3's Basic-plan measurement; the sibling uses
+  2), ImageMagick's pixel cache bounded via `MAGICK_MEMORY_LIMIT`/`MAGICK_MAP_LIMIT` (its policy
+  default of 1 GiB per image was outside the memory model). Pinned `memory_limit` /
+  `pm.max_children` overrides feed back into the sizing, read the way PHP's ini scanner reads them.
+  Logged as `[sizing]` on every boot (with a WARNING or note when the floor is forced), exported as
+  `cc_runtime_*` gauges on `/wp-metrics`.
+- **Load shedding**: the PHP-FPM upstream carries `max_conns = pm.max_children x 4` (generated at
+  startup); past it nginx answers 503 + `Retry-After` with a holding page instead of queueing a
+  burst for minutes, while cache HITs and static files keep being served (they never open an
+  upstream connection). `/healthz` and the loopback cron trigger use an uncapped upstream and queue.
+  `worker_rlimit_nofile 65536` / `worker_connections 16384` (the 1024 soft limit broke `accept()` at
+  ~500 queued requests with one worker).
+- **Keep-alive defect (r1–r3)**: `fastcgi_keep_conn on` + upstream `keepalive 32` pinned a PHP-FPM
+  worker to each kept connection until nginx closed it (60s idle). Measured on `php8.4-r3` with 3
+  workers and 10 concurrent 3s requests: 3 served in 3s, 3 at 66s, 4 x 504 at 120s; without
+  keep-alive all 10 in 12s. Both directives removed. Every capsule on r1–r3 stalls this way as soon
+  as concurrency exceeds its pool (3 on Premium).
+- **Timeouts**: `request_terminate_timeout` 300s and nginx 300s for `/wp-admin/*.php` (what WordPress
+  budgets for upgrades; `max_execution_time` counts CPU time on this build and never fires at a
+  fraction of a vCPU), 120s for public requests.
+- **Prepend**: `WP_MEMORY_LIMIT` follows the sized php.ini `memory_limit` (WordPress raises the ini
+  value to the constant when it is higher, which would have defeated the cap), `WP_MAX_MEMORY_LIMIT`
+  from the sizing; the mu-plugin gives an administrator's admin-ajax/admin-post/REST requests the
+  same raise core gives admin screens.
+- **Cache rules**: `DONOTCACHEPAGE` honoured (relayed as `X-CC-No-Cache` from an output buffer
+  opened before any other `template_redirect` callback, so define-and-exit plugins are covered),
+  WordPress `nocache_headers()` honoured as do-not-store (404s excepted), only 200 and 301 stored
+  (a 302 is usually per visitor).
+- `request_slowlog_timeout = 0` (needs `ptrace`, forbidden in the capsule: every slow request only
+  logged `failed to ptrace(ATTACH)`); `merge_and_write_config` no longer drops comments and blank
+  lines when the override is empty (`NR == FNR` with an empty first file); a pinned `memory_limit`
+  of 1M no longer crash-loops the pod.
+- **Tests**: `tests/run.sh` (3,391 assertions: cgroup v1/v2 detection, the model across 170
+  size/CPU combinations, the merge library, the configure scripts with overrides) runs in CI as the
+  `unit` job; `tests/smoke.sh` gains `sized-limits` (a `--memory 1g --cpus 0.25` container: 3
+  workers, 128M, OPcache 176M, cap 12, `WP_MEMORY_LIMIT` 128M / `WP_MAX_MEMORY_LIMIT` 256M,
+  ImageMagick 128/256 MiB, all seen through php-fpm), `inflight-cap` (20 concurrent slow requests:
+  the admitted ones complete, the rest are immediate 503s with the busy page), `pinned-overrides`
+  (a commented `pm.max_children` and a quoted `memory_limit` boot and pass `php-fpm -t`) and
+  `donotcachepage` (including define-then-exit); `metrics` asserts the sizing gauges;
+  `prepend-respects-owner` gained a positive control (it never loaded the prepend before:
+  `php -r` does not run `auto_prepend_file`).
+- Not in the image: outbound email (`wp_mail()` has no transport; noted in the readme, relay
+  proposed as its own task), probe guidance for `/healthz` (platform).
+- `REVISION=4` on every track; capsule-api `WORDPRESS_RUNTIME_TAGS` → `php8.x-r4`.

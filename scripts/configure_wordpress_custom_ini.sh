@@ -6,10 +6,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/runtime_env.sh"
 # shellcheck source=./lib/merge_and_write_config.sh
 source "$SCRIPT_DIR/lib/merge_and_write_config.sh"
+# shellcheck source=./lib/resource_sizing.sh
+source "$SCRIPT_DIR/lib/resource_sizing.sh"
 
 log() {
     echo "[custom-ini] $*"
 }
+
+# memory_limit and the OPcache sizes are derived from the container's cgroup limits (see
+# scripts/lib/resource_sizing.sh). No-op when run.sh has already loaded and exported them.
+resource_sizing_load
 
 # MAX_UPLOAD_SIZE drives upload_max_filesize and post_max_size so they stay in sync with the nginx
 # client_max_body_size set by configure_nginx_overrides.sh (same validation, same fallback).
@@ -22,10 +28,6 @@ if [[ "$_session_secure" != "0" && "$_session_secure" != "1" ]]; then
     _session_secure="1"
 fi
 
-# OPcache is sized to the container, not to a fixed 256M (see runtime_env.sh).
-_mem_mb="$(cgroup_memory_limit_mb)"
-_opcache_mb="$(opcache_memory_mb_for "$_mem_mb")"
-
 # The platform prepend (HTTPS awareness, hardened constants, runtime mu-plugin). Off with
 # WP_RUNTIME_PREPEND_ENABLED=false; a user auto_prepend_file in WORDPRESS_CUSTOM_INI overrides it.
 _prepend_line="auto_prepend_file = /usr/share/wp-runtime/prepend.php"
@@ -33,14 +35,21 @@ if is_false "${WP_RUNTIME_PREPEND_ENABLED:-true}"; then
     _prepend_line="; auto_prepend_file disabled (WP_RUNTIME_PREPEND_ENABLED=false)"
 fi
 
-log "memory_limit_mb=${_mem_mb}, opcache.memory_consumption=${_opcache_mb}, upload_size=${_upload_size}, prepend=$(is_false "${WP_RUNTIME_PREPEND_ENABLED:-true}" && echo off || echo on)"
+log "memory_limit=${CC_SIZING_PHP_MEMORY_LIMIT_MB}M, opcache.memory_consumption=${CC_SIZING_OPCACHE_MB}, upload_size=${_upload_size}, prepend=$(is_false "${WP_RUNTIME_PREPEND_ENABLED:-true}" && echo off || echo on)"
 
 DEFAULT_WORDPRESS_CUSTOM_INI="; Security / information leakage
 expose_php = Off
 cgi.fix_pathinfo = 0
 
-; Resource limits
-memory_limit = 256M
+; Resource limits.
+; memory_limit is the per-request cap and is sized to the container: 128M below 1.5G of memory,
+; 256M above. The platform prepend sets WP_MEMORY_LIMIT to the same value (so WordPress does not
+; raise it behind our back) and WP_MAX_MEMORY_LIMIT to twice it (at least 256M) for admin work.
+; Together with the PHP-FPM worker count (also sized to the container) this keeps the worst-case
+; PHP footprint inside the container's memory limit so the pod cannot be OOM-killed under load.
+memory_limit = ${CC_SIZING_PHP_MEMORY_LIMIT_MB}M
+; max_execution_time counts CPU time, not wall-clock time, on this (non-threaded) build: at a
+; fraction of a vCPU it never fires. PHP-FPM's request_terminate_timeout (300s) is the real cap.
 max_execution_time = 60
 max_input_time = 60
 max_input_vars = 3000
@@ -70,11 +79,14 @@ session.cookie_secure = ${_session_secure}
 realpath_cache_size = 4096K
 realpath_cache_ttl = 600
 
-; OPcache - important for WordPress performance. Shared memory is sized to the container.
+; OPcache - important for WordPress performance.
+; The shared-memory segment is sized to the container (memory/6, 96M..256M): WordPress core plus
+; a typical plugin set compiles to 40-120M, and only the pages actually used are charged to the
+; container, so erring large costs nothing while a full OPcache recompiles on every request.
 opcache.enable = 1
 opcache.enable_cli = 0
-opcache.memory_consumption = ${_opcache_mb}
-opcache.interned_strings_buffer = 16
+opcache.memory_consumption = ${CC_SIZING_OPCACHE_MB}
+opcache.interned_strings_buffer = ${CC_SIZING_OPCACHE_INTERNED_MB}
 opcache.max_accelerated_files = 20000
 opcache.max_wasted_percentage = 10
 
