@@ -33,7 +33,7 @@ listen.backlog = 2048
 ;                       cpu cores * PHP_FPM_WORKERS_PER_CPU )   clamped 3..64
 ; so the pool can never grow past what the container can hold, and does not fork workers the
 ; CPU quota cannot run anyway (they would only add memory and contention). nginx admits at most
-; PHP_INFLIGHT_PER_WORKER requests per worker and answers 429 past that, so a burst is shed
+; PHP_INFLIGHT_PER_WORKER requests per worker and answers 503 + Retry-After past that, so a burst is shed
 ; instead of queued for minutes. Override any of these via WORDPRESS_FPM_CONF, or tune the
 ; inputs with PHP_WORKER_MEMORY_MB / PHP_FPM_WORKERS_PER_CPU / PHP_INFLIGHT_PER_WORKER.
 pm = dynamic

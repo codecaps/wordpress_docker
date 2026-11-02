@@ -410,3 +410,4 @@ and fixes a concurrency defect found on the way. The full comparison and the rev
 - Not in the image: outbound email (`wp_mail()` has no transport; noted in the readme, relay
   proposed as its own task), probe guidance for `/healthz` (platform).
 - `REVISION=4` on every track; capsule-api `WORDPRESS_RUNTIME_TAGS` → `php8.x-r4`.
+- Review round 2 (built-in `/code-review` on PR 2, the external reviewer never answered): busy page gated on `$upstream_addr` so a crashed worker is a plain 502; `WP_MEMORY_LIMIT` (env) fed back into the sizing; public-cron loopback map; REST raise moved to `rest_pre_dispatch`; include guards; 503 wording. Spec §7.

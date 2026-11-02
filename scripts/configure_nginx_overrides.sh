@@ -461,9 +461,12 @@ EOC
 else
     cat > "$NGINX_WP_CRON_FILE" <<'EOC'
 # Auto-generated at container startup. Do not edit manually.
-# wp-cron public access enabled (DISABLE_PUBLIC_WP_CRON=false).
+# wp-cron public access enabled (DISABLE_PUBLIC_WP_CRON=false). The loopback trigger from run.sh
+# still uses the uncapped upstream ($cc_loopback_php_upstream map in nginx.conf), so it queues for
+# a worker during a burst instead of being shed; public callers go through the capped one.
 location = /wp-cron.php {
     limit_req zone=login_routes burst=3 nodelay;
+    set $php_upstream $cc_loopback_php_upstream;
     include /etc/nginx/snippets/wp-fastcgi.conf;
     fastcgi_no_cache 1;
     fastcgi_cache_bypass 1;

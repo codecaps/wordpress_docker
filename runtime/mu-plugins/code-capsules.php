@@ -179,13 +179,19 @@ add_action('template_redirect', __NAMESPACE__ . '\relay_do_not_cache', PHP_INT_M
 // Core raises memory_limit to WP_MAX_MEMORY_LIMIT for wp-admin screens (wp-admin/admin.php) but not
 // for admin-ajax.php, admin-post.php or the REST API, where page builders save, WooCommerce imports
 // and exports run and the block editor writes. Give an administrator's requests the same limit there.
-foreach (['admin_init', 'rest_api_init'] as $hook) {
-    add_action($hook, static function (): void {
-        if (current_user_can('manage_options')) {
-            wp_raise_memory_limit('admin');
-        }
-    }, 1);
+// For REST the decision is taken at rest_pre_dispatch, after WP_REST_Server::check_authentication()
+// has validated the nonce: rest_api_init fires before it and would only see the cookie session.
+function raise_admin_memory(): void
+{
+    if (current_user_can('manage_options')) {
+        wp_raise_memory_limit('admin');
+    }
 }
+add_action('admin_init', __NAMESPACE__ . '\raise_admin_memory', 1);
+add_filter('rest_pre_dispatch', static function ($result) {
+    raise_admin_memory();
+    return $result;
+}, 1);
 
 // --- Admin bar button -------------------------------------------------------------------------
 

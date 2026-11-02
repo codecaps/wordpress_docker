@@ -238,3 +238,27 @@ and macOS bash 5.3; the keep-alive removal is complete; `worker_rlimit_nofile 65
   old check never loaded the prepend: `php -r` does not run `auto_prepend_file`, so it passed
   vacuously). Tracks 8.3 and 8.5 share every changed file and are built and smoke-tested by CI on
   the PR.
+
+## 7. Second review round (built-in `/code-review` as a stand-in, 2026-11-02)
+
+The external reviewer never answered the `/code-review` comment on PR 2 (nor the one on PR 1), so
+the built-in review ran against the PR diff at extra-high effort (ten angles in one context, no
+subagents). Eight findings, each posted as an inline comment on the PR:
+
+| # | Finding | Outcome |
+|---|---|---|
+| 1 | `error_page 502 =503 @busy` turned every upstream failure (a worker killed at `request_terminate_timeout`, an OOM kill, a segfault, an oversized header, FPM gone) into the auto-refreshing busy page, so a crash read as load and the browser re-issued the request behind it every 5 s | Fixed: `@busy` serves the holding page only when `$upstream_addr` is the upstream group's name (`php_fpm`: nginx never selected a server, i.e. the cap); everything else stays a plain 502. New smoke check `upstream-crash` (a script that kills its own worker gets 502, not the page). |
+| 2 | `WP_MEMORY_LIMIT` in the environment raised the per-request cap (WordPress `ini_set`s `memory_limit` up to it) without feeding the worker budget, unlike a `WORDPRESS_CUSTOM_INI` pin | Fixed: a parseable value above the pinned or tiered limit is the per-request cap for the sizing and is logged like the ini pin; `-1` is warned about. Unit tests. |
+| 3 | Public cron mode (`DISABLE_PUBLIC_WP_CRON=false`) sent run.sh's loopback trigger through the capped upstream | Fixed: `$cc_loopback_php_upstream` map in nginx.conf (`$remote_addr` 127.0.0.1 → uncapped upstream), used by the public location. Unit test. |
+| 4 | The REST memory raise hooked `rest_api_init`, which fires before `WP_REST_Server::check_authentication()`, so it keyed on the cookie session before the nonce check | Fixed: `rest_pre_dispatch` (after authentication); `admin_init` unchanged for admin-ajax and admin-post. |
+| 5 | `readonly` constants with no include guard: a second `source` of either sizing library fails under `set -e` | Fixed: include guards in both libraries; a unit test sources them twice. |
+| 6 | Three shipped texts still said the cap answers 429 (the pool-config template, the sizing header, the metric help) | Fixed: 503. |
+| 7 | The readme did not say that a public request nginx abandons at 120 s keeps its worker until output or `request_terminate_timeout` | Fixed: one sentence in the timeouts paragraph. |
+| 8 | `_sizing_positive_int_or_default` duplicates `validated_positive_int` (runtime_env.sh) | Left as is: the sizing library is sourced by run.sh, which has no `log()`, and must stay standalone; runtime_env's validator logs through the caller's `log`. Replied on the PR. |
+
+Verification of the round: `tests/run.sh` 3,406 assertions (new: the `WP_MEMORY_LIMIT` feedback,
+double sourcing, the public-cron fragment, the busy-page gate and the loopback map); `tests/smoke.sh`
+on the rebuilt `php8.4-r4` 33/33, with `inflight-cap` still receiving the holding page (the gate
+recognises the cap) and the new `upstream-crash` receiving a plain 502; a container booted with
+`DISABLE_PUBLIC_WP_CRON=false` passed `nginx -t`, and the run.sh trigger and an external request both
+reached PHP (200). A second pass over the fix diff found nothing further.

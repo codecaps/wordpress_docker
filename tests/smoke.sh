@@ -368,6 +368,21 @@ if [ "$n200" -ge 3 ] && [ "$n503" -ge 1 ] && [ $(( n200 + n503 )) -eq 20 ] \
 else
     fail inflight-cap "200=${n200} 503=${n503} busy-page=$(grep -c 'busy right now' <<<"$busy")"
 fi
+
+# upstream-crash: a request whose PHP worker dies mid-request (here the script kills its own worker,
+# as an OOM kill or request_terminate_timeout would) is a plain 502, not the busy page: only the
+# capacity cap ("no live upstreams", $upstream_addr carrying the upstream name rather than an
+# address) gets the holding page and its auto-refresh.
+docker exec -i "$N-sized" bash -c 'cat > /var/www/html/cc-smoke-crash.php' <<'EOP'
+<?php posix_kill(getmypid(), 9);
+EOP
+crash="$(curl -s -D - "http://127.0.0.1:${sport}/cc-smoke-crash.php?s=1")"
+crash_code="$(head -1 <<<"$crash" | awk '{print $2}')"
+if [ "$crash_code" = 502 ] && ! grep -q 'busy right now' <<<"$crash"; then
+    pass upstream-crash
+else
+    fail upstream-crash "HTTP ${crash_code} busy-page=$(grep -c 'busy right now' <<<"$crash")"
+fi
 docker rm -f "$N-sized" >/dev/null
 
 # pinned-overrides: a customer pin PHP-FPM accepts (trailing comment, quoted value) is fed back

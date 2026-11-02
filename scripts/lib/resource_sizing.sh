@@ -10,10 +10,12 @@
 # the 0.28G Basic plan and makes full use of a multi-GB custom one.
 #
 # Everything computed here is only a DEFAULT. WORDPRESS_CUSTOM_INI and WORDPRESS_FPM_CONF are
-# merged afterwards and win, so any value can still be pinned by hand. Two overrides are also
+# merged afterwards and win, so any value can still be pinned by hand. Three overrides are also
 # fed back into the sizing so the features compose instead of fighting:
 #   - a memory_limit in WORDPRESS_CUSTOM_INI becomes the per-request cap the worker budget is
 #     derived from (a bigger limit means fewer workers);
+#   - a WP_MEMORY_LIMIT in the environment that is higher than that cap counts as the cap too,
+#     since WordPress raises memory_limit to it on every request (and never lowers it);
 #   - a pm.max_children in WORDPRESS_FPM_CONF re-derives the spare pool, since PHP-FPM refuses
 #     to start when max_spare_servers exceeds max_children.
 #
@@ -38,7 +40,7 @@
 #                     ceil(cpu * PHP_FPM_WORKERS_PER_CPU) )   clamped 3..64
 #   nginx      = clamp(ceil(cpu), 1, 4) worker processes
 #   inflight   = clamp(children * PHP_INFLIGHT_PER_WORKER, 8, 1024)
-#                concurrent PHP requests nginx admits before answering 429. Everything past the
+#                concurrent PHP requests nginx admits before answering 503. Everything past the
 #                FPM pool waits in a queue; without a cap a burst queues thousands of requests
 #                that each hold a worker for a minute, and the capsule stays unresponsive for
 #                hours after the burst has ended. The depth is deliberately shallow: throughput
@@ -52,6 +54,11 @@
 # two slow requests (the installer fetching translations took 41 s) stalled the whole site, and
 # the internal cron trigger takes a worker every minute. On that plan the floor exceeds the
 # memory budget by design; the boot log says so.
+
+# Sourcing-safe: a second `source` in the same shell is a no-op (the constants below are readonly,
+# and bash rejects even an identical re-assignment of a readonly variable).
+if [ -n "${RESOURCE_SIZING_LIB_LOADED:-}" ]; then return 0; fi
+RESOURCE_SIZING_LIB_LOADED=1
 
 SIZING_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./container_resources.sh
@@ -78,6 +85,11 @@ _sizing_clamp() {
     if [ "$value" -lt "$min" ]; then value="$min"; fi
     if [ "$value" -gt "$max" ]; then value="$max"; fi
     echo "$value"
+}
+
+# The tiered per-request memory_limit for a container of MEM_MB: 128M below 1.5G, 256M above.
+_sizing_default_memory_limit_mb() {
+    if [ "$1" -ge 1536 ]; then echo 256; else echo 128; fi
 }
 
 _sizing_positive_int_or_default() {
@@ -167,8 +179,7 @@ resource_sizing_compute() {
     workers_per_cpu="$(_sizing_positive_int_or_default "${PHP_FPM_WORKERS_PER_CPU:-}" "$SIZING_DEFAULT_WORKERS_PER_CPU" PHP_FPM_WORKERS_PER_CPU)"
 
     if [ -n "$memory_limit_override_mb" ]; then memory_limit_mb="$memory_limit_override_mb"
-    elif [ "$mem_mb" -ge 1536 ]; then memory_limit_mb=256
-    else memory_limit_mb=128; fi
+    else memory_limit_mb="$(_sizing_default_memory_limit_mb "$mem_mb")"; fi
 
     opcache_mb=$(_sizing_clamp $(( mem_mb / 6 )) "$SIZING_MIN_OPCACHE_MB" "$SIZING_MAX_OPCACHE_MB")
     opcache_mb=$(( (opcache_mb + 8) / 16 * 16 ))
@@ -246,7 +257,7 @@ resource_sizing_load() {
     fi
 
     local mem_mb cpu_mc source="cgroup" line
-    local ini_limit ini_limit_mb="" pinned_children=""
+    local ini_limit ini_limit_mb="" wp_limit wp_limit_mb effective_mb pinned_children=""
     mem_mb="$(container_resources_memory_limit_mb)"
     cpu_mc="$(container_resources_cpu_millicores)"
 
@@ -273,6 +284,21 @@ resource_sizing_load() {
         else
             _sizing_log "memory_limit '${ini_limit}' in WORDPRESS_CUSTOM_INI is unlimited, below 2M or unparseable; sizing the worker pool from the default limit."
             ini_limit_mb=""
+        fi
+    fi
+
+    # WP_MEMORY_LIMIT in the environment (the prepend turns it into the constant) counts too:
+    # WordPress raises memory_limit to it on every request whenever it is higher, and never
+    # lowers it, so the per-request cap in effect is the larger of the two.
+    wp_limit="${WP_MEMORY_LIMIT:-}"
+    if [ -n "$wp_limit" ]; then
+        wp_limit_mb="$(resource_sizing_ini_size_to_mb "$wp_limit")"
+        effective_mb="${ini_limit_mb:-$(_sizing_default_memory_limit_mb "$mem_mb")}"
+        if [ -z "$wp_limit_mb" ] || [ "$wp_limit_mb" -lt 2 ]; then
+            _sizing_log "WARNING: WP_MEMORY_LIMIT '${wp_limit}' is unlimited, below 2M or unparseable; WordPress applies it per request and the worker pool cannot account for it."
+        elif [ "$wp_limit_mb" -gt "$effective_mb" ]; then
+            _sizing_log "WP_MEMORY_LIMIT=${wp_limit} raises the per-request cap above ${effective_mb}M; sizing the worker pool from it."
+            ini_limit_mb="$wp_limit_mb"
         fi
     fi
 

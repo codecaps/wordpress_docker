@@ -275,4 +275,32 @@ assert_contains "$out" "No cgroup memory limit found" "memory fallback is logged
 assert_contains "$out" "No cgroup CPU quota found" "cpu fallback is logged"
 assert_contains "$out" "host 2048 2000" "host figures used"
 
+echo "WP_MEMORY_LIMIT in the environment feeds the sizing when it raises the cap"
+make_cgroup_fixture "$tmp/cg" v2 999997440 25000
+unset CC_SIZING_LOADED
+out="$(WP_MEMORY_LIMIT=512M resource_sizing_load; echo "limit=$CC_SIZING_PHP_MEMORY_LIMIT_MB worker=$CC_SIZING_WORKER_MB children=$CC_SIZING_FPM_MAX_CHILDREN")"
+assert_contains "$out" "WP_MEMORY_LIMIT=512M raises the per-request cap above 128M" "the raise is logged"
+assert_contains "$out" "limit=512 worker=256 children=3" "pool sized from the raised cap"
+unset CC_SIZING_LOADED
+out="$(WP_MEMORY_LIMIT=64M resource_sizing_load; echo "limit=$CC_SIZING_PHP_MEMORY_LIMIT_MB")"
+assert_not_contains "$out" "WP_MEMORY_LIMIT" "a lower value is not a raise (WordPress never lowers memory_limit)"
+assert_contains "$out" "limit=128" "tiered limit kept"
+unset CC_SIZING_LOADED
+out="$(WORDPRESS_CUSTOM_INI='memory_limit = 768M' WP_MEMORY_LIMIT=512M resource_sizing_load; echo "limit=$CC_SIZING_PHP_MEMORY_LIMIT_MB")"
+assert_contains "$out" "limit=768" "the higher of the ini pin and WP_MEMORY_LIMIT wins"
+unset CC_SIZING_LOADED
+out="$(WORDPRESS_CUSTOM_INI='memory_limit = 256M' WP_MEMORY_LIMIT=512M resource_sizing_load; echo "limit=$CC_SIZING_PHP_MEMORY_LIMIT_MB")"
+assert_contains "$out" "raises the per-request cap above 256M" "compared against the ini pin, not the tier"
+assert_contains "$out" "limit=512" "and wins over a lower pin"
+unset CC_SIZING_LOADED
+out="$(WP_MEMORY_LIMIT=-1 resource_sizing_load; echo "limit=$CC_SIZING_PHP_MEMORY_LIMIT_MB")"
+assert_contains "$out" "WARNING: WP_MEMORY_LIMIT '-1' is unlimited" "unlimited is warned about"
+assert_contains "$out" "limit=128" "and cannot be accounted for"
+unset CC_SIZING_LOADED
+out="$(WP_MEMORY_LIMIT=1G resource_sizing_load; resource_sizing_log)"
+assert_contains "$out" "a single request can exceed the container" "a raise at or above the container is called out"
+
+echo "the libraries can be sourced twice in one shell (include guards around the readonly constants)"
+assert_eq ok "$(bash -c 'set -e; for i in 1 2; do source "'"$HERE"'/../scripts/lib/resource_sizing.sh"; source "'"$HERE"'/../scripts/lib/container_resources.sh"; done; echo ok' 2>&1)" "double source is a no-op"
+
 finish

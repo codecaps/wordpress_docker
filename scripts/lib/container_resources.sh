@@ -15,6 +15,11 @@
 # The roots are overridable so the detection can be unit-tested with fixture
 # directories; production callers never set them.
 
+# Sourcing-safe: a second `source` in the same shell is a no-op (the constant below is readonly,
+# and bash rejects even an identical re-assignment of a readonly variable).
+if [ -n "${CONTAINER_RESOURCES_LIB_LOADED:-}" ]; then return 0; fi
+CONTAINER_RESOURCES_LIB_LOADED=1
+
 : "${CONTAINER_RESOURCES_CGROUP_ROOT:=/sys/fs/cgroup}"
 : "${CONTAINER_RESOURCES_PROC_ROOT:=/proc}"
 

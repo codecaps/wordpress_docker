@@ -95,6 +95,8 @@ assert_eq 0 "$(cat "$nconf" "$snippet" "$nginxconf" "$SCRIPTS/configure_nginx_ov
 assert_contains "$(cat "$nconf")" 'set $php_upstream php_fpm;' "server-level upstream variable"
 assert_contains "$(cat "$nconf")" 'error_page 502 =503 @busy;' "cap exhaustion answers 503 with the busy page"
 assert_contains "$(cat "$nconf")" 'fastcgi_pass php_fpm_internal;' "healthz on the uncapped upstream"
+assert_contains "$(cat "$nconf")" 'if ($upstream_addr != "php_fpm") {' "only the cap (no server selected) gets the busy page; a crashed worker stays a 502"
+assert_contains "$(cat "$nginxconf")" 'map $remote_addr $cc_loopback_php_upstream {' "loopback upstream map for the public cron mode"
 admin_line="$(grep -n 'location ~\* ^/wp-admin/\.\*\\\.php\$ {' "$nconf" | cut -d: -f1)"
 timeout_line="$(grep -n 'fastcgi_read_timeout 300s;' "$nconf" | cut -d: -f1)"
 assert_eq 1 "$(grep -c 'fastcgi_read_timeout 300s;' "$nconf")" "exactly one location raises the read timeout"
@@ -114,6 +116,11 @@ unset CC_SIZING_LOADED
 make_cgroup_fixture "$tmp/cg" v2 4294967296 300000
 "$BASH" "$SCRIPTS/configure_nginx_overrides.sh" >/dev/null
 assert_contains "$(cat "$tmp/nginx/generated_main_overrides.conf")" "worker_processes 3;" "3 workers for 3 CPUs"
+unset CC_SIZING_LOADED
+DISABLE_PUBLIC_WP_CRON=false "$BASH" "$SCRIPTS/configure_nginx_overrides.sh" >/dev/null
+cron="$(cat "$tmp/nginx/generated_wp_cron.conf")"
+assert_contains "$cron" 'set $php_upstream $cc_loopback_php_upstream;' "public cron mode: the loopback trigger still reaches the uncapped upstream"
+assert_not_contains "$cron" 'deny all' "public cron mode: no loopback restriction"
 
 echo "a bigger capsule gets bigger defaults from the same scripts"
 unset CC_SIZING_LOADED

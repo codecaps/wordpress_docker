@@ -118,7 +118,7 @@ defined in `wp-config.php` or `WORDPRESS_CONFIG_EXTRA` always wins.
 | `WP_RUNTIME_PREPEND_ENABLED` | `true` | `false` turns the whole prepend off (no defaults, no mu-plugin) |
 | `WP_DISABLE_WP_CRON` | follows `WP_CRON_TRIGGER_ENABLED` | `DISABLE_WP_CRON`: WordPress's page-load cron spawner is off because the runtime triggers cron internally |
 | `WP_DISALLOW_FILE_EDIT` | `true` | `DISALLOW_FILE_EDIT`: the theme/plugin file editors are off (a compromised admin account would otherwise be code execution) |
-| `WP_MEMORY_LIMIT` | the sized php.ini `memory_limit` (128M below 1.5 GiB, else 256M) | `WP_MEMORY_LIMIT`. WordPress raises `memory_limit` to this when it is higher, so it follows the container-sized cap instead of defeating it (WordPress's own default is 40M) |
+| `WP_MEMORY_LIMIT` | the sized php.ini `memory_limit` (128M below 1.5 GiB, else 256M) | `WP_MEMORY_LIMIT`. WordPress raises `memory_limit` to this when it is higher, so it follows the container-sized cap instead of defeating it (WordPress's own default is 40M). A value above the sized limit is fed back into the sizing (fewer, bigger workers) like a `memory_limit` pin in `WORDPRESS_CUSTOM_INI`; `-1` is warned about, since the pool cannot account for it |
 | `WP_MAX_MEMORY_LIMIT` | sized: twice the request limit where the container can hold it (128M on Basic, 256M on Standard and Premium, 512M from 2 GiB) | `WP_MAX_MEMORY_LIMIT` (admin screens, image editing, upgrades, cron). The runtime mu-plugin also applies it to an administrator's admin-ajax, admin-post and REST requests, which core leaves at the front-end limit |
 | `WP_REDIS_HOST` (+ `WP_REDIS_PORT`, `WP_REDIS_PASSWORD`, `WP_REDIS_DATABASE`, `WP_REDIS_PREFIX`) | unset | When set, the Redis Cache plugin's constants are defined from these (see [Redis Object Cache](#redis-object-cache)) |
 | `WP_RUNTIME_MU_PLUGIN_ENABLED` | `true` | Loads the runtime mu-plugin: page-cache purge on content changes, "Purge page cache" in the admin bar, `wp cc cache purge|status` |
@@ -157,7 +157,9 @@ opcache.validate_timestamps = 0
 
 > **Note:** a `memory_limit` set here is fed back into the sizing: the worst case of every worker
 > grows with it, so the worker pool shrinks accordingly (see the `[sizing]` boot log). The prepend's
-> `WP_MEMORY_LIMIT` / `WP_MAX_MEMORY_LIMIT` defaults follow it too.
+> `WP_MEMORY_LIMIT` / `WP_MAX_MEMORY_LIMIT` defaults follow it too. A `WP_MEMORY_LIMIT` environment
+> variable above the limit is fed back the same way, since WordPress raises `memory_limit` to it on
+> every request.
 
 #### `WORDPRESS_FPM_CONF`
 
@@ -180,7 +182,11 @@ status); PHP errors still go to the container's stderr. PHP-FPM listens on `127.
 Timeouts are wall-clock: `request_terminate_timeout = 300s` in the pool (what WordPress budgets for
 core and plugin upgrades, which a 0.07–0.25 vCPU pod needs), nginx `fastcgi_read_timeout` 300s for
 `/wp-admin/*.php` and 120s for public requests. php.ini's `max_execution_time = 60` counts CPU time
-on this build and never fires at a fraction of a vCPU.
+on this build and never fires at a fraction of a vCPU. When nginx gives up on a public request at
+120s it closes the FastCGI connection, which frees that request's slot under the capacity cap, but
+the PHP-FPM worker keeps running the script until it next writes output or
+`request_terminate_timeout` fires, so a burst of abandoned slow requests can keep workers busy for
+up to 180s after their clients saw a 504.
 `clear_env = no` is set so WordPress can read `WORDPRESS_DB_HOST` etc. via `getenv()`, which means
 **all** environment variables are visible to PHP code. Do not inject secrets as env vars that
 WordPress plugins should not access.
@@ -325,7 +331,9 @@ are in the container logs.
 In addition to these per-IP limits, PHP has a capsule-wide capacity cap sized to the PHP-FPM pool
 (see [Resource-aware sizing](#resource-aware-sizing)); requests past it get `503` with
 `Retry-After: 5` and a holding page (`no live upstreams` in the error log), while cached pages and
-static files keep being served.
+static files keep being served. A PHP worker that crashes or is killed mid-request
+(`request_terminate_timeout`, an OOM kill) is a plain `502`, not the holding page: only the cap,
+where nginx never selected a server, gets it.
 
 ---
 

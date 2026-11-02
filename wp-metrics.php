@@ -52,7 +52,7 @@ $metrics = [
         'value' => $sizing('FPM_MAX_CHILDREN'),
     ],
     'cc_runtime_php_max_inflight_requests' => [
-        'help'  => 'Concurrent PHP requests nginx admits before answering 429 (pm.max_children x PHP_INFLIGHT_PER_WORKER).',
+        'help'  => 'Concurrent PHP requests nginx admits before answering 503 + Retry-After (pm.max_children x PHP_INFLIGHT_PER_WORKER).',
         'type'  => 'gauge',
         'value' => $sizing('PHP_MAX_INFLIGHT'),
     ],
