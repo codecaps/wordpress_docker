@@ -1,0 +1,32 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "enabledManagers": ["custom.regex"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Digest pins of the wordpress:php8.x-fpm base image in each PHP track",
+      "managerFilePatterns": ["/^tracks/[^/]+\\.env$/"],
+      "matchStrings": [
+        "BASE_IMAGE=(?<depName>wordpress):(?<currentValue>php8\\.\\d-fpm)@(?<currentDigest>sha256:[a-f0-9]+)"
+      ],
+      "datasourceTemplate": "docker"
+    }
+  ],
+  "pinDigests": true,
+  "schedule": ["before 6am on monday"],
+  "packageRules": [
+    {
+      "description": "A track stays on its PHP minor: only digest updates. Bump REVISION in the PR.",
+      "matchManagers": ["custom.regex"],
+      "matchUpdateTypes": ["major", "minor", "patch"],
+      "enabled": false
+    },
+    {
+      "matchManagers": ["custom.regex"],
+      "matchUpdateTypes": ["digest"],
+      "commitMessageTopic": "{{depName}}:{{currentValue}} base image",
+      "prBodyNotes": ["Bump `REVISION` in the changed track before merging (CI fails without it)."]
+    }
+  ]
+}
