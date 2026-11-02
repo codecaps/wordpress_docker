@@ -28,7 +28,39 @@ $wp_cron_trigger_last_success    = is_readable($wp_cron_trigger_heartbeat_file)
 // (wp_autoload_values_to_autoload()).
 $autoload_values = "('yes','on','auto-on','auto')";
 
+// The runtime's sizing (scripts/lib/resource_sizing.sh): run.sh exports CC_SIZING_*, which reaches
+// this script through php-fpm's clear_env=no. 0 when a value is missing.
+$sizing = static function (string $name): int {
+    $value = getenv('CC_SIZING_' . $name);
+    return ($value === false || !ctype_digit((string) $value)) ? 0 : (int) $value;
+};
+
 $metrics = [
+    'cc_runtime_container_memory_bytes' => [
+        'help'  => 'Memory limit the runtime sized itself to (cgroup, or the host when unlimited).',
+        'type'  => 'gauge',
+        'value' => $sizing('MEM_MB') * 1024 * 1024,
+    ],
+    'cc_runtime_container_cpu_millicores' => [
+        'help'  => 'CPU quota the runtime sized itself to, in millicores (cgroup, or the host when unlimited).',
+        'type'  => 'gauge',
+        'value' => $sizing('CPU_MC'),
+    ],
+    'cc_runtime_fpm_max_children' => [
+        'help'  => 'PHP-FPM pm.max_children in effect (sized, or pinned via WORDPRESS_FPM_CONF). Compare with phpfpm_active_processes.',
+        'type'  => 'gauge',
+        'value' => $sizing('FPM_MAX_CHILDREN'),
+    ],
+    'cc_runtime_php_max_inflight_requests' => [
+        'help'  => 'Concurrent PHP requests nginx admits before answering 503 + Retry-After (pm.max_children x PHP_INFLIGHT_PER_WORKER).',
+        'type'  => 'gauge',
+        'value' => $sizing('PHP_MAX_INFLIGHT'),
+    ],
+    'cc_runtime_php_memory_limit_bytes' => [
+        'help'  => 'Per-request PHP memory_limit in effect (also WP_MEMORY_LIMIT unless the site defines it).',
+        'type'  => 'gauge',
+        'value' => $sizing('PHP_MEMORY_LIMIT_MB') * 1024 * 1024,
+    ],
     'wp_cron_trigger_enabled' => [
         'help'  => 'Whether the internal wp-cron trigger loop (run.sh, WP_CRON_TRIGGER_ENABLED) is on. 1=enabled, 0=disabled.',
         'type'  => 'gauge',

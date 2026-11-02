@@ -4,20 +4,27 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./lib/runtime_env.sh
 source "$SCRIPT_DIR/lib/runtime_env.sh"
+# shellcheck source=./lib/resource_sizing.sh
+source "$SCRIPT_DIR/lib/resource_sizing.sh"
 
-NGINX_MAIN_OVERRIDES_FILE="/etc/nginx/conf.d/generated_main_overrides.conf"
-NGINX_TRUSTED_PROXIES_FILE="/etc/nginx/conf.d/generated_trusted_proxies.conf"
-NGINX_HTTP_OVERRIDES_FILE="/etc/nginx/conf.d/generated_http_overrides.conf"
-NGINX_SERVER_OVERRIDES_FILE="/etc/nginx/conf.d/generated_server_overrides.conf"
-NGINX_CACHE_OVERRIDES_FILE="/etc/nginx/conf.d/generated_fastcgi_cache.conf"
-NGINX_CACHE_PURGE_FILE="/etc/nginx/conf.d/generated_cache_purge.conf"
-NGINX_XMLRPC_OVERRIDES_FILE="/etc/nginx/conf.d/generated_xmlrpc_route.conf"
-NGINX_SECURITY_HEADERS_FILE="/etc/nginx/conf.d/generated_security_headers.conf"
-NGINX_DEBUG_HEADERS_FILE="/etc/nginx/conf.d/generated_debug_headers.conf"
-NGINX_WP_CRON_FILE="/etc/nginx/conf.d/generated_wp_cron.conf"
-NGINX_EXTRA_FILE="/etc/nginx/conf.d/generated_extra.conf"
-NGINX_CACHE_KEY_FILE="/etc/nginx/conf.d/generated_cache_key.conf"
-RUNTIME_STATE_DIR="/var/run/wp-runtime"
+# Output locations are overridable only so the script can be exercised outside the image (see
+# tests/); the image always uses the defaults.
+NGINX_GENERATED_DIR="${NGINX_GENERATED_DIR:-/etc/nginx/conf.d}"
+RUNTIME_STATE_DIR="${RUNTIME_STATE_DIR:-/var/run/wp-runtime}"
+
+NGINX_MAIN_OVERRIDES_FILE="$NGINX_GENERATED_DIR/generated_main_overrides.conf"
+NGINX_UPSTREAM_FILE="$NGINX_GENERATED_DIR/generated_upstream.conf"
+NGINX_TRUSTED_PROXIES_FILE="$NGINX_GENERATED_DIR/generated_trusted_proxies.conf"
+NGINX_HTTP_OVERRIDES_FILE="$NGINX_GENERATED_DIR/generated_http_overrides.conf"
+NGINX_SERVER_OVERRIDES_FILE="$NGINX_GENERATED_DIR/generated_server_overrides.conf"
+NGINX_CACHE_OVERRIDES_FILE="$NGINX_GENERATED_DIR/generated_fastcgi_cache.conf"
+NGINX_CACHE_PURGE_FILE="$NGINX_GENERATED_DIR/generated_cache_purge.conf"
+NGINX_XMLRPC_OVERRIDES_FILE="$NGINX_GENERATED_DIR/generated_xmlrpc_route.conf"
+NGINX_SECURITY_HEADERS_FILE="$NGINX_GENERATED_DIR/generated_security_headers.conf"
+NGINX_DEBUG_HEADERS_FILE="$NGINX_GENERATED_DIR/generated_debug_headers.conf"
+NGINX_WP_CRON_FILE="$NGINX_GENERATED_DIR/generated_wp_cron.conf"
+NGINX_EXTRA_FILE="$NGINX_GENERATED_DIR/generated_extra.conf"
+NGINX_CACHE_KEY_FILE="$NGINX_GENERATED_DIR/generated_cache_key.conf"
 CACHE_STATE_FILE="${RUNTIME_STATE_DIR}/nginx-cache.env"
 
 CACHE_IGNORE_STRIP_LAYERS=16
@@ -237,9 +244,12 @@ max_conn_per_ip="$(validated_positive_int "${RATE_LIMIT_MAX_CONN_PER_IP:-$DEFAUL
 max_upload_size="$(validated_upload_size "${MAX_UPLOAD_SIZE:-$DEFAULT_MAX_UPLOAD_SIZE}" "$DEFAULT_MAX_UPLOAD_SIZE" "MAX_UPLOAD_SIZE")"
 cache_max_size="$(validated_upload_size "${CACHE_MAX_SIZE:-$DEFAULT_CACHE_MAX_SIZE}" "$DEFAULT_CACHE_MAX_SIZE" "CACHE_MAX_SIZE")"
 
-# nginx workers: one per CPU the cgroup allows, 1..4 (nginx is not the bottleneck in front of
-# PHP-FPM; `auto` would spawn one per host core regardless of the pod's quota).
-worker_processes="$(clamp "$(cgroup_cpu_limit)" 1 4)"
+# nginx workers and the PHP in-flight cap come from the sizing (scripts/lib/resource_sizing.sh):
+# one worker per CPU the cgroup allows, 1..4 (nginx is not the bottleneck in front of PHP-FPM;
+# `auto` would spawn one per host core regardless of the pod's quota). No-op when run.sh has
+# already loaded and exported the values.
+resource_sizing_load
+worker_processes="$CC_SIZING_NGINX_WORKERS"
 if [ -n "${NGINX_WORKER_PROCESSES:-}" ]; then
     worker_processes="$(validated_positive_int "$NGINX_WORKER_PROCESSES" "$worker_processes" "NGINX_WORKER_PROCESSES")"
 fi
@@ -289,6 +299,23 @@ cat > "$NGINX_MAIN_OVERRIDES_FILE" <<EOC
 worker_processes ${worker_processes};
 EOC
 
+# http{} context: the PHP-FPM upstreams. `php_fpm` carries the capacity cap: max_conns is the
+# number of FastCGI connections nginx keeps open to the pool (active + queued in FPM's backlog),
+# sized to pm.max_children x PHP_INFLIGHT_PER_WORKER; past it nginx has no live upstream and
+# default.conf turns that 502 into a 503 + Retry-After. The zone shares the count across nginx
+# workers. `php_fpm_internal` is uncapped for the health check and the loopback cron trigger.
+# No keepalive: PHP-FPM cannot multiplex, a kept connection pins a worker.
+cat > "$NGINX_UPSTREAM_FILE" <<EOC
+# Auto-generated at container startup. Do not edit manually.
+upstream php_fpm {
+    zone php_fpm 64k;
+    server 127.0.0.1:9000 max_conns=${CC_SIZING_PHP_MAX_INFLIGHT};
+}
+upstream php_fpm_internal {
+    server 127.0.0.1:9000;
+}
+EOC
+
 # http{} context: trusted intermediaries whose X-Forwarded-For is believed (plus Cloudflare's
 # edge ranges, baked at build into cloudflare_ips.conf).
 {
@@ -336,7 +363,10 @@ if is_false "${CACHE_SKIP_EMPTY:-true}"; then
     cache_skip_empty_enabled="false"
 fi
 
-cache_no_cache_vars="\$skip_cache \$upstream_http_set_cookie"
+# Never store a response that sets a cookie, one WordPress declared uncacheable (DONOTCACHEPAGE,
+# relayed as X-CC-No-Cache by the runtime mu-plugin and hidden from clients by the FastCGI snippet),
+# or one carrying WordPress's nocache headers ($cc_upstream_nocache map in nginx.conf; 404s exempt).
+cache_no_cache_vars="\$skip_cache \$upstream_http_set_cookie \$upstream_http_x_cc_no_cache \$cc_upstream_nocache"
 if [ "$cache_skip_empty_enabled" = "true" ]; then
     cache_no_cache_vars="$cache_no_cache_vars \$cache_skip_empty"
 fi
@@ -348,7 +378,9 @@ if [ "$cache_enabled" = "true" ]; then
     purge_token="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
     cat > "$NGINX_CACHE_OVERRIDES_FILE" <<EOC
 # Auto-generated at container startup. Do not edit manually.
-fastcgi_cache_valid 200 301 302 ${cache_ttl_seconds}s;
+# Pages and canonical 301s only: a 302 is usually per visitor (WooCommerce geolocation, language
+# and GeoIP redirects) and must never be handed to the next visitor.
+fastcgi_cache_valid 200 301 ${cache_ttl_seconds}s;
 fastcgi_cache_valid 404 1m;
 fastcgi_cache_use_stale error timeout updating http_500 http_503;
 fastcgi_cache_background_update on;
@@ -415,10 +447,12 @@ fi
 if is_true "$disable_public_wp_cron_raw"; then
     cat > "$NGINX_WP_CRON_FILE" <<'EOC'
 # Auto-generated at container startup. Do not edit manually.
-# wp-cron restricted to localhost; the internal trigger loop in run.sh calls it.
+# wp-cron restricted to localhost; the internal trigger loop in run.sh calls it. Uncapped upstream:
+# the trigger queues for a worker during a burst instead of being shed for the length of it.
 location = /wp-cron.php {
     allow 127.0.0.1;
     deny all;
+    set $php_upstream php_fpm_internal;
     include /etc/nginx/snippets/wp-fastcgi.conf;
     fastcgi_no_cache 1;
     fastcgi_cache_bypass 1;
@@ -427,9 +461,12 @@ EOC
 else
     cat > "$NGINX_WP_CRON_FILE" <<'EOC'
 # Auto-generated at container startup. Do not edit manually.
-# wp-cron public access enabled (DISABLE_PUBLIC_WP_CRON=false).
+# wp-cron public access enabled (DISABLE_PUBLIC_WP_CRON=false). The loopback trigger from run.sh
+# still uses the uncapped upstream ($cc_loopback_php_upstream map in nginx.conf), so it queues for
+# a worker during a burst instead of being shed; public callers go through the capped one.
 location = /wp-cron.php {
     limit_req zone=login_routes burst=3 nodelay;
+    set $php_upstream $cc_loopback_php_upstream;
     include /etc/nginx/snippets/wp-fastcgi.conf;
     fastcgi_no_cache 1;
     fastcgi_cache_bypass 1;
@@ -476,7 +513,7 @@ EOC
 fi
 
 log "Generated overrides:"
-log "  worker_processes=${worker_processes}, trusted_proxy_cidrs=${trusted_proxy_cidrs}"
+log "  worker_processes=${worker_processes}, max_inflight_php_requests=${CC_SIZING_PHP_MAX_INFLIGHT}, trusted_proxy_cidrs=${trusted_proxy_cidrs}"
 log "  cache_enabled=${cache_enabled}, cache_ttl_seconds=${cache_ttl_seconds:-unset}, cache_max_size=${cache_max_size}, cache_skip_empty=${cache_skip_empty_enabled}"
 log "  cache_ignore_query_params=$([ "$cache_ignore_query_params_enabled" = "true" ] && echo "$cache_ignore_patterns_log" || echo "disabled")"
 log "  xmlrpc_enabled=${xmlrpc_enabled_raw}, disable_public_wp_cron=${disable_public_wp_cron_raw}"

@@ -29,6 +29,14 @@ jobs:
           done
           exit "$status"
 
+  unit:
+    name: sizing + configure script tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the shell test suite
+        run: bash tests/run.sh
+
   smoke:
     name: build + smoke php${{ matrix.php }}
     runs-on: ubuntu-latest

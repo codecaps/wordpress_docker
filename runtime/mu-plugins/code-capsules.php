@@ -1,7 +1,7 @@
 <?php
 /**
  * Plugin Name: Code Capsules Runtime
- * Description: Keeps the runtime's nginx page cache fresh: purges it when content changes, adds a "Purge page cache" admin-bar item and the `wp cc cache` commands.
+ * Description: Keeps the runtime's nginx page cache fresh: purges it when content changes, honours DONOTCACHEPAGE, adds a "Purge page cache" admin-bar item and the `wp cc cache` commands.
  * Version: 1.0.0
  * Author: Code Capsules
  *
@@ -149,6 +149,49 @@ add_action('updated_option', static function (string $option): void {
 
 // Themes/plugins can ask for a purge: do_action('cc_cache_purge').
 add_action('cc_cache_purge', static fn() => purge_all('cc_cache_purge action'));
+
+// Honour DONOTCACHEPAGE: WooCommerce, membership, LMS and login-related plugins define it on pages
+// that must not be cached, including ones the URL and cookie bypass rules cannot know about (a
+// renamed cart page, a members-only page). The header tells nginx not to store the response
+// (fastcgi_no_cache) and is stripped before the client (fastcgi_hide_header in the FastCGI snippet).
+//
+// The constant is read when the response is produced, not at one hook instant, the way page-cache
+// plugins do it: an output buffer opened before any other template_redirect callback is flushed by
+// WordPress at shutdown and by a plugin's exit() alike (SEOPress, feed and export endpoints define
+// the constant and exit at priority 10), and its handler runs while headers can still be sent. The
+// 256 KB chunk keeps memory flat for streamed responses: the first chunk already decides.
+function relay_do_not_cache(): void
+{
+    if (defined('DONOTCACHEPAGE') && DONOTCACHEPAGE && !headers_sent()) {
+        header('X-CC-No-Cache: 1');
+    }
+}
+add_action('template_redirect', static function (): void {
+    ob_start(static function (string $buffer): string {
+        relay_do_not_cache();
+        return $buffer;
+    }, 262144);
+}, PHP_INT_MIN);
+add_action('template_redirect', __NAMESPACE__ . '\relay_do_not_cache', PHP_INT_MAX);
+
+// --- Admin memory --------------------------------------------------------------------------------
+
+// Core raises memory_limit to WP_MAX_MEMORY_LIMIT for wp-admin screens (wp-admin/admin.php) but not
+// for admin-ajax.php, admin-post.php or the REST API, where page builders save, WooCommerce imports
+// and exports run and the block editor writes. Give an administrator's requests the same limit there.
+// For REST the decision is taken at rest_pre_dispatch, after WP_REST_Server::check_authentication()
+// has validated the nonce: rest_api_init fires before it and would only see the cookie session.
+function raise_admin_memory(): void
+{
+    if (current_user_can('manage_options')) {
+        wp_raise_memory_limit('admin');
+    }
+}
+add_action('admin_init', __NAMESPACE__ . '\raise_admin_memory', 1);
+add_filter('rest_pre_dispatch', static function ($result) {
+    raise_admin_memory();
+    return $result;
+}, 1);
 
 // --- Admin bar button -------------------------------------------------------------------------
 
