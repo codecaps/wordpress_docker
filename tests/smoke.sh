@@ -19,7 +19,7 @@ pass() { echo "PASS $1"; }
 fail() { echo "FAIL $1${2:+: $2}"; FAILED=1; }
 
 cleanup() {
-    docker rm -f "$N-wp" "$N-wp2" "$N-wp3" "$N-sized" "$N-pinned" "$N-git" "$N-db" >/dev/null 2>&1
+    docker rm -f "$N-wp" "$N-wp2" "$N-wp3" "$N-sized" "$N-pinned" "$N-badenv" "$N-ms" "$N-git" "$N-db" >/dev/null 2>&1
     docker volume rm "$N-vol" >/dev/null 2>&1
     docker network rm "$N" >/dev/null 2>&1
     docker rmi "$GIT_IMG" >/dev/null 2>&1
@@ -204,18 +204,46 @@ else
     fail prepend-respects-owner "owner=${owner} control=${control}"
 fi
 
+# prepend-owner-cache: a constant wp-config.php defines is left to it (no "already defined" warning),
+# the names found in wp-config.php are cached on local disk instead of being re-read from the volume
+# on every request, and editing wp-config.php takes effect at once (the cache key includes the file's
+# mtime and size).
+docker exec -i "$N-wp" bash -c 'cat > /var/www/html/cc-smoke-max.php' <<'EOP'
+<?php require __DIR__ . '/wp-load.php'; echo WP_MAX_MEMORY_LIMIT;
+EOP
+# OPcache revalidates files every 60s (opcache.revalidate_freq), so after each edit the compiled
+# wp-config.php is invalidated explicitly, as a minute passing would.
+docker exec -i "$N-wp" bash -c 'cat > /var/www/html/cc-smoke-opcache.php' <<'EOP'
+<?php opcache_invalidate(__DIR__ . '/wp-config.php', true); echo 'ok';
+EOP
+docker exec "$N-wp" sed -i "1a define( 'WP_MAX_MEMORY_LIMIT', '300M' );" /var/www/html/wp-config.php
+curl -s -o /dev/null "http://127.0.0.1:${PORT}/cc-smoke-opcache.php?s=1"
+owned="$(curl -s "http://127.0.0.1:${PORT}/cc-smoke-max.php?s=1")"
+cached="$(docker exec "$N-wp" sh -c 'grep -l WP_MAX_MEMORY_LIMIT /tmp/cc-runtime-defines-*.json 2>/dev/null | wc -l')"
+docker exec "$N-wp" sed -i "/define( 'WP_MAX_MEMORY_LIMIT', '300M' );/d" /var/www/html/wp-config.php
+curl -s -o /dev/null "http://127.0.0.1:${PORT}/cc-smoke-opcache.php?s=1"
+sized="$(curl -s "http://127.0.0.1:${PORT}/cc-smoke-max.php?s=1")"
+redefined="$(docker logs "$N-wp" 2>&1 | grep -c 'WP_MAX_MEMORY_LIMIT already defined')"
+docker exec "$N-wp" rm -f /var/www/html/cc-smoke-max.php /var/www/html/cc-smoke-opcache.php
+if [ "$owned" = 300M ] && [[ "$sized" =~ ^[0-9]+M$ ]] && [ "$sized" != 300M ] && [ "$cached" -ge 1 ] && [ "$redefined" = 0 ]; then
+    pass prepend-owner-cache
+else
+    fail prepend-owner-cache "owned=${owned} after-edit=${sized} cache-files=${cached} already-defined-warnings=${redefined}"
+fi
+
 # cache-hit: the second anonymous GET of the front page is served from the page cache.
 curl -s -o /dev/null "http://127.0.0.1:${PORT}/"
 xc="$(headers_of "$N-wp" / | header_value X-Cache)"
 if [ "$xc" = "HIT" ]; then pass cache-hit; else fail cache-hit "X-Cache: ${xc}"; fi
 
-# cache-bypass-rules: shop-like slugs and plural query params are cached; search and the cart are not.
+# cache-bypass-rules: shop-like slugs and plural query params are cached; search, the cart and the REST
+# API under every spelling (?rest_route= on plain permalinks, /index.php/wp-json/) are not.
 bypass_ok=1; detail=""
 for path in /cartoons/ /accounting-tips/ "/?tags=news" "/shop/?filters=red"; do
     xc="$(headers_of "$N-wp" "$path" | header_value X-Cache)"
     [ "$xc" != "BYPASS" ] || { bypass_ok=0; detail="$detail $path=$xc"; }
 done
-for path in "/?s=hello" /cart/ "/checkout/?step=1" "/?add-to-cart=5"; do
+for path in "/?s=hello" /cart/ "/checkout/?step=1" "/?add-to-cart=5" "/?rest_route=/" "/index.php/wp-json/"; do
     xc="$(headers_of "$N-wp" "$path" | header_value X-Cache)"
     [ "$xc" = "BYPASS" ] || { bypass_ok=0; detail="$detail $path=$xc"; }
 done
@@ -309,6 +337,26 @@ if grep -qx 'wp_cron_trigger_enabled 1' <<<"$metrics" && grep -q '^wordpress_cor
 else
     fail metrics "$(grep -E '^(cc_runtime|wp_cron_trigger_enabled|wordpress_core)' <<<"$metrics" | tr '\n' ' ' | head -c 300)"
 fi
+
+# metrics-port: the same metrics are scrapeable from the pod network at :9254/metrics (the loopback
+# server above is not), and that port serves nothing else.
+podip="$(docker exec "$N-wp" hostname -i | awk '{print $1}')"
+pod_metrics="$(docker exec "$N-wp" curl -s "http://${podip}:9254/metrics")"
+pod_other="$(docker exec "$N-wp" curl -s -o /dev/null -w '%{http_code}' "http://${podip}:9254/wp-metrics")"
+if grep -qE '^cc_runtime_fpm_max_children [1-9][0-9]*$' <<<"$pod_metrics" \
+        && grep -q '^wp_cron_trigger_last_success_timestamp_seconds ' <<<"$pod_metrics" && [ "$pod_other" = 404 ]; then
+    pass metrics-port
+else
+    fail metrics-port "ip=${podip} other=${pod_other} $(head -c 120 <<<"$pod_metrics")"
+fi
+
+# httpoxy: a client's Proxy request header never reaches PHP as HTTP_PROXY (CVE-2016-5385).
+docker exec -i "$N-wp" bash -c 'cat > /var/www/html/cc-smoke-proxy.php' <<'EOP'
+<?php echo var_export(getenv('HTTP_PROXY'), true), '|', var_export($_SERVER['HTTP_PROXY'] ?? null, true);
+EOP
+proxy="$(curl -s -H 'Proxy: http://evil.test:3128' "http://127.0.0.1:${PORT}/cc-smoke-proxy.php?s=1")"
+docker exec "$N-wp" rm -f /var/www/html/cc-smoke-proxy.php
+if [ -n "$proxy" ] && ! grep -q 'evil.test' <<<"$proxy"; then pass httpoxy; else fail httpoxy "${proxy:-empty response}"; fi
 
 # fpm-sizing: the pool was derived from the limits (3..64 children), listens on loopback, and the
 # nginx in-flight cap follows it (4 per worker, at least 8).
@@ -405,6 +453,66 @@ else
 fi
 docker rm -f "$N-pinned" >/dev/null
 
+# env-fallback: settings nginx would reject, or that are plain invalid, fall back to the defaults and
+# the site comes up. Before, a /33 CIDR or an oversized size passed validation and failed nginx -t, and
+# a rejected value was no better: the validator's log line ended up inside the fallback value, so
+# the generated config failed nginx -t either way and the pod crash-looped.
+run_wp "$N-badenv" "" "$IMG" -e WP_CRON_TRIGGER_ENABLED=false -e TRUSTED_PROXY_CIDRS=10.0.0.0/8,10.0.0.0/33 \
+    -e MAX_UPLOAD_SIZE=99999999999G -e CACHE_MAX_SIZE=99999999999G -e RATE_LIMIT_MAX_CONN_PER_IP=70000 \
+    -e NGINX_WORKER_PROCESSES=99999 -e 'CSP_HEADER=default-src "self"'
+code="$(wait_http "$N-badenv" /healthz 150)"
+blogs="$(docker logs "$N-badenv" 2>&1)"
+n_invalid="$(grep -c '^\[nginx-overrides\] Invalid' <<<"$blogs")"
+up="$(docker exec "$N-badenv" php -r 'echo ini_get("upload_max_filesize");' 2>&1)"
+if [ "$code" = 200 ] && [ "$n_invalid" = 6 ] && [ "$up" = 64M ] && ! grep -q 'test failed' <<<"$blogs"; then
+    pass env-fallback
+else
+    fail env-fallback "healthz=${code} invalid-lines=${n_invalid} upload_max_filesize='${up}' $(grep -m1 'emerg' <<<"$blogs")"
+fi
+docker rm -f "$N-badenv" >/dev/null
+
+# cron-multisite: every site of a multisite network gets its cron run. The trigger used to ask for a
+# site called 127.0.0.1, which WordPress cannot route (it redirects and exits after wp-cron.php has
+# already answered 200), so no site's cron ever ran while the trigger reported success.
+docker exec "$N-db" mysql -uroot -ppw -e 'CREATE DATABASE wpms' >/dev/null 2>&1
+# WP_HTTP_BLOCK_EXTERNAL: a new site's first cron run checks for core/plugin/theme updates over the
+# internet; blocked, it cannot hold the site's cron lock (60s) while the check waits for the event.
+run_wp "$N-ms" "" "$IMG" -e WORDPRESS_DB_NAME=wpms -e WP_CRON_TRIGGER_INTERVAL_SECONDS=2 -e WP_CRON_TRIGGER_TARGETS_REFRESH_SECONDS=3 \
+    -e "WORDPRESS_CONFIG_EXTRA=define('WP_HTTP_BLOCK_EXTERNAL', true);"
+wait_http "$N-ms" /healthz 150 >/dev/null
+ms_ok=1
+wp_cli "$N-ms" core multisite-install --url=http://cc-smoke.test --title=MS --admin_user=smoke \
+    --admin_password='smoke-pass-1' --admin_email=smoke@example.test --skip-email >/dev/null 2>&1 || ms_ok=0
+wp_cli "$N-ms" site create --slug=sub --url=http://cc-smoke.test >/dev/null 2>&1 || ms_ok=0
+docker exec -i "$N-ms" bash -c 'mkdir -p /var/www/html/wp-content/mu-plugins && cat > /var/www/html/wp-content/mu-plugins/cc-smoke-cron.php' <<'EOP'
+<?php
+add_action('cc_smoke_cron', function () {
+    file_put_contents('/tmp/cc-smoke-cron-' . get_current_blog_id(), (string) time());
+});
+EOP
+for url in http://cc-smoke.test/ http://cc-smoke.test/sub/; do
+    wp_cli "$N-ms" --url="$url" eval 'wp_schedule_single_event(time() - 60, "cc_smoke_cron");' >/dev/null 2>&1 || ms_ok=0
+done
+ran=""
+for _ in $(seq 1 75); do
+    sleep 1
+    ran="$(docker exec "$N-ms" sh -c 'ls /tmp/cc-smoke-cron-* 2>/dev/null' | sort | xargs)"
+    [ "$ran" = "/tmp/cc-smoke-cron-1 /tmp/cc-smoke-cron-2" ] && break
+done
+mslogs="$(docker logs "$N-ms" 2>&1)"
+hb="$(docker exec "$N-ms" cat /var/run/wp-runtime/cron-last-run)"
+if [ "$ms_ok" = 1 ] && [ "$ran" = "/tmp/cc-smoke-cron-1 /tmp/cc-smoke-cron-2" ] && [ -n "$hb" ] \
+        && grep -q '\[wp-cron-trigger\] 2 site(s), up to 3 per run:' <<<"$mslogs" \
+        && grep '\[wp-cron-trigger\] 2 site(s)' <<<"$mslogs" | grep -q 'http://cc-smoke.test/sub/'; then
+    pass cron-multisite
+else
+    sub_lock="$(wp_cli "$N-ms" --url=http://cc-smoke.test/sub/ transient get doing_cron 2>&1 | tail -1)"
+    sub_events="$(wp_cli "$N-ms" --url=http://cc-smoke.test/sub/ cron event list --fields=hook,next_run_relative --format=csv 2>&1 | grep -c cc_smoke_cron)"
+    sub_hits="$(grep -c '"GET /sub/wp-cron.php?doing_wp_cron HTTP/1.1" 200' <<<"$mslogs")"
+    fail cron-multisite "setup=${ms_ok} ran='${ran}' heartbeat='${hb}' sub: lock='${sub_lock}' event-still-scheduled=${sub_events} trigger-hits=${sub_hits}; $(grep '\[wp-cron-trigger\]' <<<"$mslogs" | tail -3 | tr '\n' ' ')"
+fi
+docker rm -f "$N-ms" >/dev/null
+
 # graceful-stop: a stop finishes well inside the grace period, exits 0, and shuts down cleanly.
 start=$(date +%s)
 docker stop -t 30 "$N-wp" >/dev/null
@@ -423,13 +531,53 @@ run_wp "$N-wp2" "$N-vol" "$IMG"
 wait_http "$N-wp2" /healthz >/dev/null
 docker exec "$N-wp2" sed -i "s/^\$wp_version = .*/\$wp_version = '6.5.5';/" /var/www/html/wp-includes/version.php
 docker rm -f "$N-wp2" >/dev/null
-run_wp "$N-wp3" "$N-vol" "$IMG"
+run_wp "$N-wp3" "$N-vol" "$IMG" -e WP_CRON_TRIGGER_INTERVAL_SECONDS=2 -e WP_CRON_TRIGGER_TARGETS_REFRESH_SECONDS=3
 wait_http "$N-wp3" /healthz >/dev/null
 marker="$(docker exec "$N-wp3" grep '^\$wp_version' /var/www/html/wp-includes/version.php)"
 if [ "$marker" = "\$wp_version = '6.5.5';" ]; then
     pass existing-volume
 else
     fail existing-volume "${marker:-version.php missing}"
+fi
+
+# cron-honest-https: the trigger asks for the site the way its visitors reach it (host and scheme
+# from the site URL), and the heartbeat comes from PHP, only when the cron dispatcher really ran.
+# A plugin that ends plain-HTTP requests early (as HTTPS-forcing plugins do) stops cron while the
+# site URL is http: every trigger request still gets its 200, but the heartbeat must stay empty.
+# Once the site URL is https the trigger sends X-Forwarded-Proto: https and the event runs.
+port3="$(port_of "$N-wp3")"
+docker exec -i "$N-wp3" bash -c 'mkdir -p /var/www/html/wp-content/mu-plugins && cat > /var/www/html/wp-content/mu-plugins/cc-smoke-cron.php' <<'EOP'
+<?php
+add_action('init', function () {
+    if (wp_doing_cron() && !is_ssl()) {
+        exit;
+    }
+}, 0);
+add_action('cc_smoke_cron', function () {
+    file_put_contents('/tmp/cc-smoke-cron-' . get_current_blog_id(), (string) time());
+});
+EOP
+wp_cli "$N-wp3" eval 'wp_schedule_single_event(time() - 60, "cc_smoke_cron");' >/dev/null 2>&1
+sleep 2
+docker exec "$N-wp3" sh -c ': > /var/run/wp-runtime/cron-last-run'
+sleep 8
+hb_http="$(docker exec "$N-wp3" cat /var/run/wp-runtime/cron-last-run)"
+ran_http="$(docker exec "$N-wp3" sh -c 'ls /tmp/cc-smoke-cron-1 2>/dev/null | wc -l')"
+answered="$(docker logs --since 9s "$N-wp3" 2>&1 | grep -c '"GET /wp-cron.php?doing_wp_cron HTTP/1.1" 200')"
+wp_cli "$N-wp3" option update siteurl "https://127.0.0.1:${port3}" >/dev/null 2>&1
+wp_cli "$N-wp3" option update home "https://127.0.0.1:${port3}" >/dev/null 2>&1
+ran=0
+for _ in $(seq 1 30); do
+    sleep 1
+    docker exec "$N-wp3" test -f /tmp/cc-smoke-cron-1 && { ran=1; break; }
+done
+hb_https="$(docker exec "$N-wp3" cat /var/run/wp-runtime/cron-last-run)"
+metric="$(docker exec "$N-wp3" curl -s 127.0.0.1:8080/wp-metrics | sed -n 's/^wp_cron_trigger_last_success_timestamp_seconds //p')"
+if [ -z "$hb_http" ] && [ "$ran_http" = 0 ] && [ "$answered" -ge 2 ] && [ "$ran" = 1 ] && [ -n "$hb_https" ] \
+        && [ "${metric:-0}" -gt 0 ] && docker logs "$N-wp3" 2>&1 | grep -q "\[wp-cron-trigger\] 1 site(s), up to 3 per run: https://127.0.0.1:${port3}/"; then
+    pass cron-honest-https
+else
+    fail cron-honest-https "http: heartbeat='${hb_http}' ran=${ran_http} answered-200=${answered}; https: ran=${ran} heartbeat='${hb_https}' metric=${metric:-none}"
 fi
 
 # healthz: 200 while FPM is up; non-200 (or the container exits non-zero) once FPM dies.

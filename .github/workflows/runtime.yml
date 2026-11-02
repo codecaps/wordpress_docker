@@ -7,6 +7,13 @@ on:
 permissions:
   contents: read
 
+# An explicit `shell: bash` runs steps as `bash --noprofile --norc -eo pipefail`; GitHub's implicit
+# default is `bash -e` without pipefail, under which `./build.sh | tee build.log` passes even when
+# the build fails.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   revision:
     name: REVISION bumped with BASE_IMAGE

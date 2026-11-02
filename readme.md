@@ -19,13 +19,14 @@ is tunable through environment variables.
 |---|---|
 | `Dockerfile` | The runtime. Requires `--build-arg BASE_IMAGE` and `--build-arg MIN_PHP_VERSION` (no defaults). |
 | `tracks/php<minor>.env` | One track per PHP minor: `BASE_IMAGE` (digest-pinned), `MIN_PHP_VERSION`, `REVISION`. |
-| `build.sh` / `push.sh` | Build / push one track. |
+| `build.sh` / `push.sh` | Build / push one track. `push.sh` refuses to overwrite an existing tag, and refuses when the registry cannot say whether one exists (an expired login). |
+| `tools/` | Host-side helpers for the push scripts (not part of any image). |
 | `tests/smoke.sh` | Smoke test for a built image (installs WordPress with WP-CLI and exercises cache, purge, limits, headers, shutdown, the sized pool and the in-flight cap). |
 | `tests/run.sh` | Shell unit tests for the cgroup detection, the sizing model and the configure scripts (`bash tests/run.sh`, bash 4+; on macOS use Homebrew's). |
 | `run.sh`, `scripts/` | Container startup: generate config from env, start php-fpm then nginx, supervise, shut down gracefully. |
 | `nginx.conf`, `default.conf`, `nginx/snippets/` | nginx configuration (static parts; the dynamic parts are generated at startup). |
 | `runtime/` | Files installed to `/usr/share/wp-runtime`: the platform prepend and the runtime mu-plugin. |
-| `wp-metrics.php` | WordPress application metrics endpoint (internal). |
+| `wp-metrics.php` | WordPress application metrics endpoint (`:9254/metrics` on the pod network). |
 | `git/` | Git capsule image: the runtime plus the capsule's repo (see `git/README.md`). |
 | `docker_run.sh` | Run a locally built runtime against a MySQL on the host. |
 | `legacy/` | Per-WordPress-version images for capsules not yet retrofitted. Delete once capsule-api's legacy image map is gone. |
@@ -55,7 +56,9 @@ Images go to `europe-west4-docker.pkg.dev/appstrax/main/wordpress-runtime`:
    never pushes).
 2. Build: `./build.sh 8.4` (prints the immutable ref).
 3. Smoke: `tests/smoke.sh <ref> <MIN_PHP_VERSION>` — every check must `PASS`.
-4. Push: `./push.sh 8.4` (immutable tag, then the moving alias).
+4. Push: `./push.sh 8.4` (immutable tag, then the moving alias). It stops when the tag already
+   exists, and also when the registry cannot be asked (log in again first: an expired login must
+   not turn into an overwrite of a deployed tag).
 5. Bump the tag in capsule-api's `WORDPRESS_RUNTIME_TAGS` and deploy it.
 6. Run capsule-api's `redeploy-wordpress-capsules` job to roll the new tag to every capsule on
    that track.
@@ -365,11 +368,28 @@ warning if the fetch fails). Rebuild the image to refresh them.
 |---|---|---|
 | `XMLRPC_ENABLED` | `false` | Set to `true` to enable XML-RPC (Jetpack, WP mobile app, external publishing) |
 | `DISABLE_PUBLIC_WP_CRON` | `true` | Restrict `wp-cron.php` to `127.0.0.1`. Triggered internally instead — see `WP_CRON_TRIGGER_ENABLED`. |
-| `WP_CRON_TRIGGER_ENABLED` | `true` | `run.sh` calls `wp-cron.php` over `127.0.0.1` on an interval. Set to `false` only if the capsule triggers cron some other way. |
+| `WP_CRON_TRIGGER_ENABLED` | `true` | `run.sh` calls each site's `wp-cron.php` through the container's nginx on an interval. Set to `false` only if the capsule triggers cron some other way. |
 | `WP_CRON_TRIGGER_INTERVAL_SECONDS` | `60` | Seconds between internal `wp-cron.php` triggers. |
+| `WP_CRON_TRIGGER_SITES_PER_RUN` | `3` | Sites triggered per run. A multisite network with more sites is covered in rotation (each site every ceil(sites ÷ this) runs), so a large network cannot tie up the whole PHP-FPM pool every minute. |
+| `WP_CRON_TRIGGER_TARGETS_REFRESH_SECONDS` | `3600` | How long the list of site URLs (asked from WordPress with WP-CLI, as `www-data`, without plugins or themes) is kept. |
 | `SESSION_COOKIE_SECURE` | `1` | PHP `session.cookie_secure`. Set to `0` for local HTTP development. |
 | `CSP_HEADER` | see below | Full `Content-Security-Policy` value. Empty string disables it. Quotes (`"`), `$` and backslashes are rejected (default used). |
 | `HSTS_HEADER` | `max-age=31536000` | `Strict-Transport-Security` value, sent only on HTTPS requests. Empty string disables it. Add `; includeSubDomains` yourself only if every subdomain of the domain is HTTPS. |
+
+**How cron is triggered.** `wp-cron.php` answers before WordPress loads (it calls
+`fastcgi_finish_request()` first), so the trigger's HTTP status cannot say whether cron ran. The
+trigger therefore requests each site the way its visitors reach it: the host, path and scheme of the
+site URL that WordPress reports (`X-Forwarded-Proto: https` for an HTTPS site, so a plugin that
+redirects plain-HTTP requests does not end the cron request early), and every site of a multisite
+network rather than an address WordPress cannot route. Until WordPress can answer (not installed
+yet, database down) it triggers `http://127.0.0.1/` and asks again within five minutes. The
+heartbeat (`wp_cron_trigger_last_success_timestamp_seconds`) is written by PHP when the cron
+dispatcher reaches its event list, not by the trigger, so it only advances when cron really ran.
+
+Invalid values for any variable in this section and in the rate-limit, upload, cache and proxy
+sections fall back to the default with an `Invalid ...` line in the container log; values nginx
+itself would reject (a `/33` CIDR, a 100 GB+ size, `RATE_LIMIT_MAX_CONN_PER_IP` above 65535,
+`NGINX_WORKER_PROCESSES` above 64) count as invalid, so a typo can no longer crash-loop the pod.
 | `NGINX_WORKER_PROCESSES` | from the CPU quota (1–4) | nginx worker count (see [Resource-aware sizing](#resource-aware-sizing) for the PHP knobs). |
 | `SHUTDOWN_TIMEOUT_SECONDS` | `20` | How long a graceful shutdown waits for in-flight requests before terminating nginx/php-fpm. |
 | `FPM_STARTUP_TIMEOUT_SECONDS` | `600` | How long the holding page is served while waiting for php-fpm to listen on a slow first boot. |
@@ -433,19 +453,24 @@ The platform prepend applies to the CLI too, so `wp` sees the same constants as 
 
 ## Prometheus Metrics
 
-The container exposes two Prometheus metrics ports (the exporters run as `www-data`). No sidecar required.
+The container exposes three Prometheus metrics ports (the exporters run as `www-data`). No sidecar required.
 
 | Port | Exporter | Key metrics |
 |---|---|---|
 | `9113` | nginx-prometheus-exporter | `nginx_connections_active`, `nginx_http_requests_total`, `nginx_connections_waiting` |
 | `9253` | php-fpm_exporter | `phpfpm_listen_queue`, `phpfpm_max_children_reached_total`, `phpfpm_active_processes`, `phpfpm_slow_requests_total` |
+| `9254` | WordPress (`/metrics`) | `wp_cron_trigger_last_success_timestamp_seconds`, `cc_runtime_*`, post / user / autoload counts |
 
-WordPress application metrics (post counts, user counts, autoloaded options, the installed core
-version, `wp_cron_trigger_*`, and the sizing in effect as `cc_runtime_container_memory_bytes`,
+The WordPress application metrics on `9254` (path `/metrics`; every other path is a 404) are post
+counts, user counts, autoloaded options, the installed core version, `wp_cron_trigger_enabled`
+and `wp_cron_trigger_last_success_timestamp_seconds` (alert on staleness only where the trigger is
+enabled), and the sizing in effect as `cc_runtime_container_memory_bytes`,
 `cc_runtime_container_cpu_millicores`, `cc_runtime_fpm_max_children`,
-`cc_runtime_php_max_inflight_requests`, `cc_runtime_php_memory_limit_bytes`) are available at
-`http://127.0.0.1:8080/wp-metrics` from inside the container only. The script lives at `/usr/share/wp-runtime/wp-metrics.php`, outside the docroot,
-so a volume over `/var/www/html` does not hide it.
+`cc_runtime_php_max_inflight_requests`, `cc_runtime_php_memory_limit_bytes`. Each scrape runs a few
+`COUNT(*)` queries in a PHP-FPM worker; a 30–60 s scrape interval is plenty. The same output is at
+`http://127.0.0.1:8080/wp-metrics` inside the container. The script lives at
+`/usr/share/wp-runtime/wp-metrics.php`, outside the docroot, so a volume over `/var/www/html` does
+not hide it.
 
 > The cluster's Prometheus must be told to scrape these ports (a PodMonitor on the WordPress pod
 > labels); nothing scrapes them by default.
@@ -500,7 +525,9 @@ site defines itself.
 | `scripts/configure_nginx_overrides.sh` | Generates all dynamic nginx config fragments (incl. `worker_processes` and the PHP in-flight cap) and the cache state for the mu-plugin |
 | `scripts/lib/container_resources.sh` | Reads the container's cgroup (v1/v2) CPU and memory limits |
 | `scripts/lib/resource_sizing.sh` | Derives the PHP / PHP-FPM / nginx sizing from those limits (and from pinned overrides) |
-| `scripts/lib/runtime_env.sh` | Shared validators |
+| `scripts/lib/runtime_env.sh` | Shared validators (results on stdout, log lines on stderr) |
+| `scripts/lib/wp_cron_trigger.sh` | Which sites the internal cron trigger asks for, and how (used by `run.sh`) |
+| `scripts/lib/cloudflare_ips.sh` | Validates the Cloudflare edge ranges fetched at build time |
 | `scripts/lib/merge_and_write_config.sh` | Shared awk-based merge logic |
 | `tests/run.sh` | Shell test suite for the detection, the sizing model and the configure scripts |
 | `runtime/prepend.php` | Platform prepend (HTTPS, hardened constants, loads the mu-plugin) |

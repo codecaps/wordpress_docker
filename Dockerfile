@@ -85,23 +85,6 @@ COPY nginx.conf /etc/nginx/nginx.conf
 COPY default.conf /etc/nginx/conf.d/default.conf
 COPY nginx/snippets/wp-fastcgi.conf /etc/nginx/snippets/wp-fastcgi.conf
 
-# Bake Cloudflare edge ranges into the trusted-proxy set so X-Forwarded-For
-# recursion resolves the true client IP when proxied by Cloudflare (see nginx.conf).
-# Prefer the live published lists; fall back to the version-controlled snapshot
-# (with a warning) if the fetch fails, so the image never ships an empty trust set.
-COPY cloudflare_ips.fallback.conf /usr/share/nginx/cloudflare_ips.fallback.conf
-RUN set -eux; \
-    v4="$(curl -fsSL --max-time 10 https://www.cloudflare.com/ips-v4 || true)"; \
-    v6="$(curl -fsSL --max-time 10 https://www.cloudflare.com/ips-v6 || true)"; \
-    if printf '%s' "$v4" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$'; then \
-        { echo '# Fetched from Cloudflare at build time.'; \
-          for ip in $v4 $v6; do echo "set_real_ip_from $ip;"; done; \
-        } > /etc/nginx/conf.d/cloudflare_ips.conf; \
-    else \
-        echo 'WARNING: Cloudflare IP fetch failed/empty at build — using bundled fallback ranges.' >&2; \
-        cp /usr/share/nginx/cloudflare_ips.fallback.conf /etc/nginx/conf.d/cloudflare_ips.conf; \
-    fi
-
 # Copy entrypoint and startup scripts.
 COPY run.sh /usr/run.sh
 COPY scripts /usr/scripts
@@ -110,13 +93,33 @@ RUN chmod +x /usr/run.sh \
               /usr/scripts/configure_wordpress_fpm_conf.sh \
               /usr/scripts/configure_nginx_overrides.sh
 
+# Bake Cloudflare edge ranges into the trusted-proxy set so X-Forwarded-For
+# recursion resolves the true client IP when proxied by Cloudflare (see nginx.conf).
+# Prefer the live published lists; fall back to the version-controlled snapshot
+# (with a warning) if either fetch fails or returns anything but CIDR lines, so the
+# image never ships an empty trust set or a directive nginx would reject at boot.
+COPY cloudflare_ips.fallback.conf /usr/share/nginx/cloudflare_ips.fallback.conf
+RUN set -eu; \
+    . /usr/scripts/lib/cloudflare_ips.sh; \
+    v4="$(curl -fsSL --max-time 10 https://www.cloudflare.com/ips-v4 || true)"; \
+    v6="$(curl -fsSL --max-time 10 https://www.cloudflare.com/ips-v6 || true)"; \
+    if conf="$(cloudflare_ips_conf "$v4" "$v6")"; then \
+        printf '%s\n' "$conf" > /etc/nginx/conf.d/cloudflare_ips.conf; \
+    else \
+        echo 'WARNING: Cloudflare IP fetch failed, empty or malformed at build — using bundled fallback ranges.' >&2; \
+        cp /usr/share/nginx/cloudflare_ips.fallback.conf /etc/nginx/conf.d/cloudflare_ips.conf; \
+    fi; \
+    grep -c '^set_real_ip_from ' /etc/nginx/conf.d/cloudflare_ips.conf
+
 RUN mkdir -p /var/cache/nginx/wordpress /var/run/wp-runtime \
     && chown -R www-data:www-data /var/cache/nginx \
     && chown root:www-data /var/run/wp-runtime && chmod 750 /var/run/wp-runtime
 
 EXPOSE 80
+# Prometheus: nginx exporter, PHP-FPM exporter, WordPress application metrics (/metrics).
 EXPOSE 9113
 EXPOSE 9253
+EXPOSE 9254
 
 # run.sh handles TERM (and the upstream image's QUIT) with a graceful nginx/php-fpm shutdown.
 STOPSIGNAL SIGTERM

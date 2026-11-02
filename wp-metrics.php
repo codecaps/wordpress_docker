@@ -8,8 +8,10 @@ require '/var/www/html/wp-load.php';
 
 global $wpdb, $wp_version;
 
-// Written by the internal wp-cron trigger loop in run.sh (a separate bash
-// process — this is the only way to hand its state to this PHP script).
+// Written by the platform prepend (runtime/prepend.php) each time WordPress's cron
+// dispatcher really runs, i.e. reaches its event list after WordPress loaded for the
+// site the internal trigger (run.sh) asked for. A trigger request WordPress redirected
+// or aborted does not count, so the timestamp means "cron ran", not "a request was sent".
 // Report the enabled flag alongside the timestamp: without it, "0 / stale"
 // looks identical for a capsule that has turned it off as it does for one
 // where the loop actually died — any alert on the timestamp needs to be
@@ -19,7 +21,7 @@ $wp_cron_trigger_enabled_raw = getenv('WP_CRON_TRIGGER_ENABLED');
 $wp_cron_trigger_enabled_raw = $wp_cron_trigger_enabled_raw === false ? 'true' : (string) $wp_cron_trigger_enabled_raw;
 $wp_cron_trigger_enabled     = in_array(strtolower(trim($wp_cron_trigger_enabled_raw)), ['1', 'true', 'on', 'yes'], true) ? 1 : 0;
 
-$wp_cron_trigger_heartbeat_file  = '/var/run/wp-cron-trigger-last-success';
+$wp_cron_trigger_heartbeat_file  = '/var/run/wp-runtime/cron-last-run';
 $wp_cron_trigger_last_success    = is_readable($wp_cron_trigger_heartbeat_file)
     ? (int) trim((string) file_get_contents($wp_cron_trigger_heartbeat_file))
     : 0;
@@ -67,7 +69,7 @@ $metrics = [
         'value' => $wp_cron_trigger_enabled,
     ],
     'wp_cron_trigger_last_success_timestamp_seconds' => [
-        'help'  => 'Unix timestamp of the last successful internal wp-cron trigger. 0 if disabled or never succeeded yet — check wp_cron_trigger_enabled before alerting on staleness.',
+        'help'  => 'Unix timestamp of the last time the WordPress cron dispatcher actually ran (written by PHP, not by the trigger). 0 if disabled, never ran yet, or WP_RUNTIME_PREPEND_ENABLED=false — check wp_cron_trigger_enabled before alerting on staleness.',
         'type'  => 'gauge',
         'value' => $wp_cron_trigger_last_success,
     ],

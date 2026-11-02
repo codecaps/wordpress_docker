@@ -122,6 +122,63 @@ cron="$(cat "$tmp/nginx/generated_wp_cron.conf")"
 assert_contains "$cron" 'set $php_upstream $cc_loopback_php_upstream;' "public cron mode: the loopback trigger still reaches the uncapped upstream"
 assert_not_contains "$cron" 'deny all' "public cron mode: no loopback restriction"
 
+echo "values nginx would reject fall back to the defaults instead of failing nginx -t"
+unset CC_SIZING_LOADED
+make_cgroup_fixture "$tmp/cg" v2 999997440 25000
+TRUSTED_PROXY_CIDRS="10.0.0.0/8,10.0.0.0/33" MAX_UPLOAD_SIZE=99999999999G CACHE_MAX_SIZE=99999999999G \
+    RATE_LIMIT_MAX_CONN_PER_IP=70000 NGINX_WORKER_PROCESSES=99999 CACHE_TTL_SECONDS=99999999999 \
+    "$BASH" "$SCRIPTS/configure_nginx_overrides.sh" > "$tmp/badenv.log" 2>&1
+http="$(cat "$tmp/nginx/generated_http_overrides.conf")"
+assert_contains "$(cat "$tmp/nginx/generated_trusted_proxies.conf")" $'set_real_ip_from 10.0.0.0/8;\nset_real_ip_from 172.16.0.0/12;\nset_real_ip_from 192.168.0.0/16;' "a /33 entry falls back to the default proxy list"
+assert_contains "$http" "client_max_body_size 64m;" "an oversized upload limit falls back to 64M"
+assert_contains "$http" "max_size=512m" "an oversized cache falls back to 512M"
+assert_contains "$(cat "$tmp/nginx/generated_server_overrides.conf")" "limit_conn per_ip_conn 100;" "limit_conn above 65535 falls back"
+assert_contains "$(cat "$tmp/nginx/generated_main_overrides.conf")" "worker_processes 1;" "99999 workers falls back to the sized count"
+assert_contains "$(cat "$tmp/nginx/generated_fastcgi_cache.conf")" "fastcgi_cache_valid 200 301 60s;" "an eleven-digit TTL falls back to 60s"
+assert_eq 6 "$(grep -c 'Invalid\|Falling back' "$tmp/badenv.log")" "each fallback is logged"
+
+echo "only the PHP handler caches: no no-op cache directives elsewhere"
+assert_eq 0 "$(grep -c 'fastcgi_no_cache\|fastcgi_cache_bypass' "$nconf")" "default.conf has none outside the generated cache include"
+assert_eq 1 "$(grep -c 'fastcgi_cache WORDPRESS;' "$nconf")" "one caching location"
+unset CC_SIZING_LOADED
+XMLRPC_ENABLED=true "$BASH" "$SCRIPTS/configure_nginx_overrides.sh" >/dev/null
+assert_eq 0 "$(cat "$tmp/nginx/generated_xmlrpc_route.conf" "$tmp/nginx/generated_wp_cron.conf" | grep -c 'fastcgi_no_cache\|fastcgi_cache_bypass')" "xmlrpc and wp-cron fragments carry none"
+unset CC_SIZING_LOADED
+DISABLE_PUBLIC_WP_CRON=false "$BASH" "$SCRIPTS/configure_nginx_overrides.sh" >/dev/null
+assert_eq 0 "$(grep -c 'fastcgi_no_cache\|fastcgi_cache_bypass' "$tmp/nginx/generated_wp_cron.conf")" "public wp-cron fragment carries none"
+
+echo "the REST API is never page-cached, under any of its URL forms"
+skipmap="$(sed -n '/map \$request_uri \$skip_cache_uri {/,/^    }/p' "$nginxconf")"
+assert_contains "$skipmap" '~*^/wp-json(/|$)' "/wp-json/"
+assert_contains "$skipmap" '~*^/index\.php/wp-json(/|$)' "/index.php/wp-json/ (almost-pretty permalinks)"
+assert_contains "$skipmap" '~*[?&]rest_route=' "?rest_route= (plain permalinks, every fresh install)"
+
+echo "httpoxy: a client's Proxy header never reaches PHP as HTTP_PROXY"
+assert_contains "$(cat "$snippet")" 'fastcgi_param HTTP_PROXY "";' "every PHP location (shared snippet)"
+assert_eq 2 "$(grep -c 'fastcgi_param HTTP_PROXY      "";' "$nginxconf")" "both metrics locations"
+
+echo "WordPress metrics are scrapeable from the pod network, and nothing else there"
+metrics_server="$(sed -n '/listen 9254;/,/^    }/p' "$nginxconf")"
+assert_contains "$metrics_server" "location = /metrics {" "served at /metrics"
+assert_contains "$metrics_server" "root /var/www/html;" "with the docroot the prepend needs"
+assert_contains "$metrics_server" "fastcgi_param SCRIPT_FILENAME /usr/share/wp-runtime/wp-metrics.php;" "the same script"
+assert_contains "$metrics_server" $'location / {\n            return 404;' "every other path is a 404"
+assert_contains "$(cat "$HERE/../Dockerfile")" "EXPOSE 9254" "port declared"
+
+echo "build and CI hardening"
+assert_contains "$(cat "$HERE/../Dockerfile")" ". /usr/scripts/lib/cloudflare_ips.sh;" "Cloudflare ranges validated line by line at build"
+assert_contains "$(cat "$HERE/../.github/workflows/runtime.yml")" $'defaults:\n  run:\n    shell: bash' "CI steps run with pipefail"
+assert_contains "$(cat "$HERE/../.dockerignore")" $'\ntools' "host-side tools stay out of the build context"
+
+echo "the cron trigger addresses sites as visitors do, and PHP writes the heartbeat"
+runsh="$(cat "$HERE/../run.sh")"
+assert_not_contains "$runsh" 'Host: 127.0.0.1' "no hard-coded loopback host"
+assert_contains "$runsh" 'wp_cron_trigger_fire "${WP_CRON_TRIGGER_TARGETS[$i]}"' "fires each target"
+assert_contains "$runsh" 'chown www-data:www-data "$CRON_HEARTBEAT_FILE"' "heartbeat file writable by PHP only"
+assert_not_contains "$runsh" 'wp-cron-trigger-last-success' "the loop no longer writes a heartbeat"
+assert_contains "$(cat "$HERE/../runtime/prepend.php")" "\$GLOBALS['wp_filter']['pre_get_ready_cron_jobs']" "heartbeat hook in the prepend"
+assert_contains "$(cat "$HERE/../wp-metrics.php")" "'/var/run/wp-runtime/cron-last-run'" "metrics read the PHP heartbeat"
+
 echo "a bigger capsule gets bigger defaults from the same scripts"
 unset CC_SIZING_LOADED
 make_cgroup_fixture "$tmp/cg" v1 4294967296 200000
