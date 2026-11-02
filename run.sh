@@ -179,6 +179,15 @@ if [[ "${wp_cron_trigger_enabled,,}" =~ ^(true|1|yes|on)$ ]]; then
                     done
                     [ "$n" -gt 5 ] && shown="${shown} (+$(( n - 5 )) more)"
                     echo "[wp-cron-trigger] ${n} site(s), up to ${wp_cron_trigger_sites_per_run} per run:${shown}"
+                    cycle_runs="$(wp_cron_trigger_cycle_runs "$n" "$wp_cron_trigger_sites_per_run")"
+                    if [ "$cycle_runs" -gt 1 ]; then
+                        cycle_seconds=$(( cycle_runs * wp_cron_trigger_interval ))
+                        if [ "$cycle_seconds" -gt 3600 ]; then
+                            echo "[wp-cron-trigger] WARNING: each site's cron runs only every ${cycle_seconds}s (${cycle_runs} runs of ${wp_cron_trigger_interval}s); raise WP_CRON_TRIGGER_SITES_PER_RUN for a network this size" >&2
+                        else
+                            echo "[wp-cron-trigger] each site is triggered every ${cycle_runs} runs (${cycle_seconds}s)"
+                        fi
+                    fi
                 fi
             fi
             # wp-cron.php calls fastcgi_finish_request() and closes the connection before doing

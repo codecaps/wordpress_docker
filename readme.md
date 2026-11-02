@@ -370,7 +370,7 @@ warning if the fetch fails). Rebuild the image to refresh them.
 | `DISABLE_PUBLIC_WP_CRON` | `true` | Restrict `wp-cron.php` to `127.0.0.1`. Triggered internally instead — see `WP_CRON_TRIGGER_ENABLED`. |
 | `WP_CRON_TRIGGER_ENABLED` | `true` | `run.sh` calls each site's `wp-cron.php` through the container's nginx on an interval. Set to `false` only if the capsule triggers cron some other way. |
 | `WP_CRON_TRIGGER_INTERVAL_SECONDS` | `60` | Seconds between internal `wp-cron.php` triggers. |
-| `WP_CRON_TRIGGER_SITES_PER_RUN` | `3` | Sites triggered per run. A multisite network with more sites is covered in rotation (each site every ceil(sites ÷ this) runs), so a large network cannot tie up the whole PHP-FPM pool every minute. |
+| `WP_CRON_TRIGGER_SITES_PER_RUN` | `3` | Sites triggered per run. A multisite network with more sites is covered in rotation, in site-id order: each site every ceil(sites ÷ this) runs, logged at startup, with a warning when that is longer than an hour. A large network cannot tie up the whole PHP-FPM pool every minute; raise this (or shorten the interval) when the warning appears. |
 | `WP_CRON_TRIGGER_TARGETS_REFRESH_SECONDS` | `3600` | How long the list of site URLs (asked from WordPress with WP-CLI, as `www-data`, without plugins or themes) is kept. |
 | `SESSION_COOKIE_SECURE` | `1` | PHP `session.cookie_secure`. Set to `0` for local HTTP development. |
 | `CSP_HEADER` | see below | Full `Content-Security-Policy` value. Empty string disables it. Quotes (`"`), `$` and backslashes are rejected (default used). |
@@ -380,8 +380,9 @@ warning if the fetch fails). Rebuild the image to refresh them.
 `fastcgi_finish_request()` first), so the trigger's HTTP status cannot say whether cron ran. The
 trigger therefore requests each site the way its visitors reach it: the host, path and scheme of the
 site URL that WordPress reports (`X-Forwarded-Proto: https` for an HTTPS site, so a plugin that
-redirects plain-HTTP requests does not end the cron request early), and every site of a multisite
-network rather than an address WordPress cannot route. Until WordPress can answer (not installed
+redirects plain-HTTP requests does not end the cron request early), and every live site of a
+multisite network (all of them, not archived, deleted or spam; `WP_CRON_TRIGGER_SITES_PER_RUN` per
+run, in rotation) rather than an address WordPress cannot route. Until WordPress can answer (not installed
 yet, database down) it triggers `http://127.0.0.1/` and asks again within five minutes. The
 heartbeat (`wp_cron_trigger_last_success_timestamp_seconds`) is written by PHP when the cron
 dispatcher reaches its event list, not by the trigger, so it only advances when cron really ran.

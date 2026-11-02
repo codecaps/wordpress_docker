@@ -34,20 +34,28 @@ wp_cron_trigger_parse_url() {
     echo "$scheme $host $path"
 }
 
-# Prints the site URLs WordPress reports, one per line: the site URL, or for a multisite network up
-# to 100 of its live sites, most recently updated first (get_sites() treats 0 as "no limit", so the
-# cap is a literal: inside `wp eval`, $args is WP-CLI's own argument list, not extra arguments).
+# Prints the site URLs WordPress reports, one per line: the site URL, or for a multisite network
+# every live site (not archived, deleted or spam), in id order so the rotation stays fair across
+# refreshes. There is no cap: WP_CRON_TRIGGER_SITES_PER_RUN bounds the load when the URLs are
+# fired, and a site left out of this list would never get cron at all (DISABLE_WP_CRON is on).
+# Each siteurl is read with one query instead of get_site_url(), which switches to every blog and
+# keeps its options in the runtime cache: thousands of sites would exhaust the CLI memory_limit.
+# "number" => 0 means no limit to WP_Site_Query (its default is 100).
 # Fails (prints nothing) when WordPress cannot answer.
 wp_cron_trigger_discover() {
     setpriv --reuid=www-data --regid=www-data --clear-groups \
         env HOME=/tmp wp --path=/var/www/html --skip-plugins --skip-themes --quiet eval '
             if (is_multisite()) {
+                global $wpdb;
                 $ids = get_sites([
-                    "number" => 100, "fields" => "ids", "archived" => 0, "deleted" => 0,
-                    "spam" => 0, "orderby" => "last_updated", "order" => "DESC",
+                    "number" => 0, "fields" => "ids", "archived" => 0, "deleted" => 0,
+                    "spam" => 0, "orderby" => "id", "order" => "ASC",
                 ]);
                 foreach ($ids as $id) {
-                    echo get_site_url($id), "\n";
+                    $url = $wpdb->get_var("SELECT option_value FROM {$wpdb->get_blog_prefix($id)}options WHERE option_name = \"siteurl\"");
+                    if ($url) {
+                        echo $url, "\n";
+                    }
                 }
             } else {
                 echo site_url(), "\n";
@@ -90,6 +98,13 @@ wp_cron_trigger_batch() {
     for (( i = 0; i < count; i++ )); do
         echo $(( (offset + i) % n ))
     done
+}
+
+# Prints how many runs it takes to trigger every one of N targets at PER_RUN per run.
+wp_cron_trigger_cycle_runs() {
+    local n="$1" per_run="$2"
+    if [ "$n" -le 0 ]; then echo 0; return; fi
+    echo $(( (n + per_run - 1) / per_run ))
 }
 
 # "<scheme>://<host><path>" for a target, for the logs.

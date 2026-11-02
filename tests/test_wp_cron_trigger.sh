@@ -52,6 +52,22 @@ assert_contains "$call" "--reuid=www-data" "as www-data"
 assert_contains "$call" "--skip-plugins --skip-themes" "without plugins or themes"
 assert_contains "$call" "eval-args=1" "exactly one argument after eval"
 
+echo "discovery covers every live site of a network: no cap, stable order, constant memory"
+# A cap (it was the 100 most recently updated sites) left every other subsite without cron, since
+# DISABLE_WP_CRON is on; the per-run limit bounds the load instead.
+code="$(declare -f wp_cron_trigger_discover)"
+assert_contains "$code" '"number" => 0' "no limit on the site query (WP_Site_Query defaults to 100)"
+assert_contains "$code" '"orderby" => "id", "order" => "ASC"' "id order, so the rotation is stable across refreshes"
+assert_not_contains "$code" "get_site_url(" "siteurl read per site without switching blogs (no per-site cache growth)"
+assert_contains "$code" '"archived" => 0, "deleted" => 0' "archived and deleted sites left out"
+
+echo "cycle length: how many runs to reach every site"
+assert_eq 1 "$(wp_cron_trigger_cycle_runs 1 3)" "single site"
+assert_eq 1 "$(wp_cron_trigger_cycle_runs 3 3)" "exactly one batch"
+assert_eq 2 "$(wp_cron_trigger_cycle_runs 4 3)" "one more than a batch"
+assert_eq 34 "$(wp_cron_trigger_cycle_runs 101 3)" "101 sites at 3 per run"
+assert_eq 0 "$(wp_cron_trigger_cycle_runs 0 3)" "no sites"
+
 echo "refresh: WordPress's answer is used and kept for the refresh period"
 wp_cron_trigger_discover() { printf 'https://example.com/\nhttps://example.com/sub/\r\nnot a url\n'; }
 WP_CRON_TRIGGER_EXPIRES=0; WP_CRON_TRIGGER_TARGETS=()
