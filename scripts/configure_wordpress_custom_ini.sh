@@ -31,11 +31,20 @@ fi
 # The platform prepend (HTTPS awareness, hardened constants, runtime mu-plugin). Off with
 # WP_RUNTIME_PREPEND_ENABLED=false; a user auto_prepend_file in WORDPRESS_CUSTOM_INI overrides it.
 _prepend_line="auto_prepend_file = /usr/share/wp-runtime/prepend.php"
-if is_false "${WP_RUNTIME_PREPEND_ENABLED:-true}"; then
+_prepend_enabled="$(validated_bool "${WP_RUNTIME_PREPEND_ENABLED:-true}" "true" "WP_RUNTIME_PREPEND_ENABLED")"
+if [ "$_prepend_enabled" = "false" ]; then
     _prepend_line="; auto_prepend_file disabled (WP_RUNTIME_PREPEND_ENABLED=false)"
+else
+    # The prepend reads these switches itself on every request, with the same fallback; they are
+    # checked here only so that a typo is reported, once, at startup.
+    validated_bool "${WP_RUNTIME_MU_PLUGIN_ENABLED:-true}" "true" "WP_RUNTIME_MU_PLUGIN_ENABLED" >/dev/null
+    validated_bool "${WP_DISALLOW_FILE_EDIT:-true}" "true" "WP_DISALLOW_FILE_EDIT" >/dev/null
+    if [ -n "${WP_DISABLE_WP_CRON:-}" ]; then
+        validated_bool "$WP_DISABLE_WP_CRON" "the default (follows WP_CRON_TRIGGER_ENABLED)" "WP_DISABLE_WP_CRON" >/dev/null
+    fi
 fi
 
-log "memory_limit=${CC_SIZING_PHP_MEMORY_LIMIT_MB}M, opcache.memory_consumption=${CC_SIZING_OPCACHE_MB}, upload_size=${_upload_size}, prepend=$(is_false "${WP_RUNTIME_PREPEND_ENABLED:-true}" && echo off || echo on)"
+log "memory_limit=${CC_SIZING_PHP_MEMORY_LIMIT_MB}M, opcache.memory_consumption=${CC_SIZING_OPCACHE_MB}, upload_size=${_upload_size}, prepend=$([ "$_prepend_enabled" = "true" ] && echo on || echo off)"
 
 DEFAULT_WORDPRESS_CUSTOM_INI="; Security / information leakage
 expose_php = Off
@@ -44,7 +53,7 @@ cgi.fix_pathinfo = 0
 ; Resource limits.
 ; memory_limit is the per-request cap and is sized to the container: 128M below 1.5G of memory,
 ; 256M above. The platform prepend sets WP_MEMORY_LIMIT to the same value (so WordPress does not
-; raise it behind our back) and WP_MAX_MEMORY_LIMIT to twice it (at least 256M) for admin work.
+; raise it behind our back) and WP_MAX_MEMORY_LIMIT to up to twice it for admin work.
 ; Together with the PHP-FPM worker count (also sized to the container) this keeps the worst-case
 ; PHP footprint inside the container's memory limit so the pod cannot be OOM-killed under load.
 memory_limit = ${CC_SIZING_PHP_MEMORY_LIMIT_MB}M

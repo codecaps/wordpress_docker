@@ -4,6 +4,18 @@ set -euo pipefail
 RUN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR="/var/run/wp-runtime"
 
+# shellcheck source=./scripts/lib/runtime_env.sh
+source "$RUN_DIR/scripts/lib/runtime_env.sh"
+log() {
+    echo "[run] $*"
+}
+
+# Validated before anything uses them: a value such as 20s broke the arithmetic in the TERM trap,
+# so run.sh died without waiting for in-flight requests, and 10m meant the startup wait never
+# timed out.
+shutdown_timeout="$(validated_positive_int "${SHUTDOWN_TIMEOUT_SECONDS:-20}" 20 SHUTDOWN_TIMEOUT_SECONDS)"
+fpm_startup_timeout="$(validated_positive_int "${FPM_STARTUP_TIMEOUT_SECONDS:-600}" 600 FPM_STARTUP_TIMEOUT_SECONDS)"
+
 # State shared with PHP (cache token, cron heartbeat): readable by www-data only.
 mkdir -p "$STATE_DIR"
 chown root:www-data "$STATE_DIR"
@@ -55,7 +67,7 @@ _shutdown() {
     [ -n "${NGINX_EXP_PID:-}" ] && kill -TERM "$NGINX_EXP_PID" 2>/dev/null || true
     [ -n "${FPM_EXP_PID:-}"   ] && kill -TERM "$FPM_EXP_PID"   2>/dev/null || true
 
-    deadline=$(( SECONDS + ${SHUTDOWN_TIMEOUT_SECONDS:-20} ))
+    deadline=$(( SECONDS + shutdown_timeout ))
     while [ "$SECONDS" -lt "$deadline" ]; do
         if ! kill -0 "${NGINX_PID:-0}" 2>/dev/null && ! kill -0 "${FPM_PID:-0}" 2>/dev/null; then
             break
@@ -97,8 +109,8 @@ until fpm_listening; do
         echo "[run] php-fpm exited during startup (status ${status:-?})" >&2
         _shutdown "${status:-1}"
     fi
-    if [ $(( SECONDS - fpm_wait_started )) -ge "${FPM_STARTUP_TIMEOUT_SECONDS:-600}" ]; then
-        echo "[run] php-fpm is not listening after ${FPM_STARTUP_TIMEOUT_SECONDS:-600}s; removing the starting page anyway" >&2
+    if [ $(( SECONDS - fpm_wait_started )) -ge "$fpm_startup_timeout" ]; then
+        echo "[run] php-fpm is not listening after ${fpm_startup_timeout}s; removing the starting page anyway" >&2
         break
     fi
     sleep 0.5
@@ -130,26 +142,18 @@ FPM_EXP_PID=$!
 # networks and HTTPS-only sites run their cron), at most WP_CRON_TRIGGER_SITES_PER_RUN of them
 # (default 3, rotating through a larger network); the list is refreshed every
 # WP_CRON_TRIGGER_TARGETS_REFRESH_SECONDS (default 3600). See scripts/lib/wp_cron_trigger.sh.
-wp_cron_trigger_enabled="${WP_CRON_TRIGGER_ENABLED:-true}"
-
-# Validation matches validated_positive_int() in scripts/lib/runtime_env.sh (min 1, fallback on
-# anything non-numeric). Without it, a bad value makes `sleep` fail: under `set -e` that would
-# silently kill the loop for good (0 would instead spin it tight enough to exhaust FPM workers).
-_wp_cron_positive_int() {
-    local name="$1" value="$2" fallback="$3"
-    if [[ "$value" =~ ^[0-9]{1,9}$ ]] && [ "$value" -ge 1 ]; then
-        echo "$value"
-        return
-    fi
-    echo "[wp-cron-trigger] Invalid ${name} value '${value}'. Falling back to ${fallback}." >&2
-    echo "$fallback"
-}
-wp_cron_trigger_interval="$(_wp_cron_positive_int WP_CRON_TRIGGER_INTERVAL_SECONDS "${WP_CRON_TRIGGER_INTERVAL_SECONDS:-60}" 60)"
-wp_cron_trigger_sites_per_run="$(_wp_cron_positive_int WP_CRON_TRIGGER_SITES_PER_RUN "${WP_CRON_TRIGGER_SITES_PER_RUN:-3}" 3)"
-wp_cron_trigger_refresh="$(_wp_cron_positive_int WP_CRON_TRIGGER_TARGETS_REFRESH_SECONDS "${WP_CRON_TRIGGER_TARGETS_REFRESH_SECONDS:-3600}" 3600)"
+#
+# A typo in the switch falls back to on: it used to stop the loop while the prepend kept
+# WordPress's own spawner off, so no cron ran at all. The prepend and wp-metrics.php apply the
+# same fallback. A bad number would make `sleep` fail: under `set -e` that would silently kill the
+# loop for good (0 would instead spin it tight enough to exhaust FPM workers).
+wp_cron_trigger_enabled="$(validated_bool "${WP_CRON_TRIGGER_ENABLED:-true}" true WP_CRON_TRIGGER_ENABLED)"
+wp_cron_trigger_interval="$(validated_positive_int "${WP_CRON_TRIGGER_INTERVAL_SECONDS:-60}" 60 WP_CRON_TRIGGER_INTERVAL_SECONDS)"
+wp_cron_trigger_sites_per_run="$(validated_positive_int "${WP_CRON_TRIGGER_SITES_PER_RUN:-3}" 3 WP_CRON_TRIGGER_SITES_PER_RUN)"
+wp_cron_trigger_refresh="$(validated_positive_int "${WP_CRON_TRIGGER_TARGETS_REFRESH_SECONDS:-3600}" 3600 WP_CRON_TRIGGER_TARGETS_REFRESH_SECONDS)"
 echo "[run]   wp_cron_trigger_enabled=${wp_cron_trigger_enabled}, wp_cron_trigger_interval_seconds=${wp_cron_trigger_interval}, sites_per_run=${wp_cron_trigger_sites_per_run}"
 
-if [[ "${wp_cron_trigger_enabled,,}" =~ ^(true|1|yes|on)$ ]]; then
+if [ "$wp_cron_trigger_enabled" = "true" ]; then
     echo "[wp-cron-trigger] internal trigger loop starting (interval=${wp_cron_trigger_interval}s)"
     (
         # Deliberately not strict: this loop must survive for the life of the container on

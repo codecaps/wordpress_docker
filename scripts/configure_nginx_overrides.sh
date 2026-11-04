@@ -213,9 +213,9 @@ EOC
 
 # --- Parse env vars ---
 
-xmlrpc_enabled_raw="${XMLRPC_ENABLED:-$DEFAULT_XMLRPC_ENABLED}"
-disable_public_wp_cron_raw="${DISABLE_PUBLIC_WP_CRON:-$DEFAULT_DISABLE_PUBLIC_WP_CRON}"
-debug_headers_raw="${DEBUG_HEADERS:-$DEFAULT_DEBUG_HEADERS}"
+xmlrpc_enabled="$(validated_bool "${XMLRPC_ENABLED:-$DEFAULT_XMLRPC_ENABLED}" "$DEFAULT_XMLRPC_ENABLED" "XMLRPC_ENABLED")"
+disable_public_wp_cron="$(validated_bool "${DISABLE_PUBLIC_WP_CRON:-$DEFAULT_DISABLE_PUBLIC_WP_CRON}" "$DEFAULT_DISABLE_PUBLIC_WP_CRON" "DISABLE_PUBLIC_WP_CRON")"
+debug_headers="$(validated_bool "${DEBUG_HEADERS:-$DEFAULT_DEBUG_HEADERS}" "$DEFAULT_DEBUG_HEADERS" "DEBUG_HEADERS")"
 nginx_extra_conf="${NGINX_EXTRA_CONF:-}"
 
 csp_header="$(validated_header_value "${CSP_HEADER-$DEFAULT_CSP_HEADER}" "$DEFAULT_CSP_HEADER" "CSP_HEADER")"
@@ -346,10 +346,7 @@ EOC
 # Never cache an empty-bodied 200 (e.g. a blank page from a failed whole-page
 # output buffer). Controlled by CACHE_SKIP_EMPTY (default: true); references the
 # $cache_skip_empty map in nginx.conf.
-cache_skip_empty_enabled="true"
-if is_false "${CACHE_SKIP_EMPTY:-true}"; then
-    cache_skip_empty_enabled="false"
-fi
+cache_skip_empty_enabled="$(validated_bool "${CACHE_SKIP_EMPTY:-true}" "true" "CACHE_SKIP_EMPTY")"
 
 # Never store a response that sets a cookie, one WordPress declared uncacheable (DONOTCACHEPAGE,
 # relayed as X-CC-No-Cache by the runtime mu-plugin and hidden from clients by the FastCGI snippet),
@@ -417,7 +414,7 @@ else
 fi
 
 # XML-RPC route (location{} context). Never cached: the location does not enable fastcgi_cache.
-if is_true "$xmlrpc_enabled_raw"; then
+if [ "$xmlrpc_enabled" = "true" ]; then
     cat > "$NGINX_XMLRPC_OVERRIDES_FILE" <<'EOC'
 # Auto-generated at container startup. Do not edit manually.
 include /etc/nginx/snippets/wp-fastcgi.conf;
@@ -431,7 +428,7 @@ fi
 
 # wp-cron location block (server{} context, full location block). Never cached: the location does
 # not enable fastcgi_cache.
-if is_true "$disable_public_wp_cron_raw"; then
+if [ "$disable_public_wp_cron" = "true" ]; then
     cat > "$NGINX_WP_CRON_FILE" <<'EOC'
 # Auto-generated at container startup. Do not edit manually.
 # wp-cron restricted to localhost; the internal trigger loop in run.sh calls it. Uncapped upstream:
@@ -471,7 +468,7 @@ fi
 } > "$NGINX_SECURITY_HEADERS_FILE"
 
 # Debug headers (location{} context inside PHP handler): X-Cache when DEBUG_HEADERS=true.
-if is_true "$debug_headers_raw"; then
+if [ "$debug_headers" = "true" ]; then
     cat > "$NGINX_DEBUG_HEADERS_FILE" <<'EOC'
 # Auto-generated at container startup. Do not edit manually.
 more_set_headers "X-Cache: $upstream_cache_status";
@@ -499,8 +496,8 @@ log "Generated overrides:"
 log "  worker_processes=${worker_processes}, max_inflight_php_requests=${CC_SIZING_PHP_MAX_INFLIGHT}, trusted_proxy_cidrs=${trusted_proxy_cidrs}"
 log "  cache_enabled=${cache_enabled}, cache_ttl_seconds=${cache_ttl_seconds:-unset}, cache_max_size=${cache_max_size}, cache_skip_empty=${cache_skip_empty_enabled}"
 log "  cache_ignore_query_params=$([ "$cache_ignore_query_params_enabled" = "true" ] && echo "$cache_ignore_patterns_log" || echo "disabled")"
-log "  xmlrpc_enabled=${xmlrpc_enabled_raw}, disable_public_wp_cron=${disable_public_wp_cron_raw}"
+log "  xmlrpc_enabled=${xmlrpc_enabled}, disable_public_wp_cron=${disable_public_wp_cron}"
 log "  max_upload_size=${max_upload_size}, max_conn_per_ip=${max_conn_per_ip}"
 log "  normal_routes_rpm=${normal_routes_rpm}, protected_routes_rpm=${protected_routes_rpm}, login_routes_rpm=${login_routes_rpm}, api_routes_rpm=${api_routes_rpm}"
-log "  debug_headers=${debug_headers_raw}, csp_header=$([ -n "$csp_header" ] && echo "set" || echo "empty"), hsts_header=$([ -n "$hsts_header" ] && echo "set" || echo "empty")"
+log "  debug_headers=${debug_headers}, csp_header=$([ -n "$csp_header" ] && echo "set" || echo "empty"), hsts_header=$([ -n "$hsts_header" ] && echo "set" || echo "empty")"
 log "  nginx_extra_conf=$([ -n "$nginx_extra_conf" ] && echo "set" || echo "empty")"

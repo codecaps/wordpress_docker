@@ -149,6 +149,13 @@ assert_eq 4 "${S[CC_SIZING_FPM_MAX_CHILDREN]}" "workers-per-cpu knob"
 out="$(PHP_FPM_WORKERS_PER_CPU=lots resource_sizing_compute 2000 1000 2>&1)"
 assert_contains "$out" "Invalid PHP_FPM_WORKERS_PER_CPU" "invalid knob is reported"
 assert_contains "$out" "CC_SIZING_FPM_MAX_CHILDREN=12" "invalid knob falls back to the default"
+# A leading zero is decimal: bash arithmetic reads 08 and 09 as bad octal, which aborted the sizing
+# (and, under set -e, the container start).
+PHP_FPM_WORKERS_PER_CPU=08 PHP_INFLIGHT_PER_WORKER=09 size 4000 1000
+assert_eq 8  "${S[CC_SIZING_FPM_MAX_CHILDREN]:-}" "workers-per-cpu 08 is 8"
+assert_eq 72 "${S[CC_SIZING_PHP_MAX_INFLIGHT]:-}" "inflight-per-worker 09 is 9 (8 workers x 9)"
+PHP_WORKER_MEMORY_MB=0200 size 2000 4000
+assert_eq 200 "${S[CC_SIZING_WORKER_MB]:-}" "worker budget 0200 is 200"
 
 echo "ini size parsing"
 assert_eq 256  "$(resource_sizing_ini_size_to_mb 256M)" "256M"
@@ -256,6 +263,9 @@ assert_contains "$out" "pool=4/2/1/2 inflight=16" "a pin with a trailing comment
 unset CC_SIZING_LOADED
 out="$(WORDPRESS_FPM_CONF=$'[www]\npm.max_children = "4"' resource_sizing_load; echo "pool=$CC_SIZING_FPM_MAX_CHILDREN/$CC_SIZING_FPM_START_SERVERS/$CC_SIZING_FPM_MIN_SPARE/$CC_SIZING_FPM_MAX_SPARE")"
 assert_contains "$out" "pool=4/2/1/2" "a quoted pin is honoured"
+unset CC_SIZING_LOADED
+out="$(WORDPRESS_FPM_CONF=$'[www]\npm.max_children = 08' resource_sizing_load; echo "pool=$CC_SIZING_FPM_MAX_CHILDREN/$CC_SIZING_FPM_START_SERVERS/$CC_SIZING_FPM_MIN_SPARE/$CC_SIZING_FPM_MAX_SPARE")"
+assert_contains "$out" "pool=8/$(resource_sizing_spares 8 | tr ' ' '/')" "a pin with a leading zero is decimal (PHP-FPM reads 08 as 8)"
 assert_eq 36 "$(WORDPRESS_FPM_CONF=$'[www]\npm.max_children = 9' bash -c 'unset CC_SIZING_LOADED; source "'"$HERE"'/../scripts/lib/resource_sizing.sh"; resource_sizing_load >/dev/null; echo "$CC_SIZING_PHP_MAX_INFLIGHT"')" "in-flight cap follows the pinned count"
 unset CC_SIZING_LOADED
 out="$(WORDPRESS_FPM_CONF=$'[www]\npm.max_children = many' resource_sizing_load; echo "pool=$CC_SIZING_FPM_MAX_CHILDREN")"

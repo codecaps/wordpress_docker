@@ -31,11 +31,18 @@ if (PHP_SAPI !== 'cli'
         $value = getenv($name);
         return ($value === false || $value === '') ? $default : $value;
     };
-    $falsy = static function (?string $value): bool {
-        return in_array(strtolower(trim((string) $value)), ['0', 'false', 'no', 'off'], true);
-    };
-    $truthy = static function (?string $value): bool {
-        return in_array(strtolower(trim((string) $value)), ['1', 'true', 'yes', 'on'], true);
+    // An on/off switch: true/1/yes/on or false/0/no/off in any case; unset, empty or anything else
+    // is the default. Same rule as validated_bool() in scripts/lib/runtime_env.sh, which reports a
+    // typo once at startup (this runs on every request, so it never logs).
+    $flag = static function (string $name, bool $default) use ($env): bool {
+        $value = strtolower(trim((string) $env($name, '')));
+        if (in_array($value, ['1', 'true', 'yes', 'on'], true)) {
+            return true;
+        }
+        if (in_array($value, ['0', 'false', 'no', 'off'], true)) {
+            return false;
+        }
+        return $default;
     };
 
     // Constants the site defines itself (wp-config.php, or WORDPRESS_CONFIG_EXTRA which the
@@ -92,14 +99,11 @@ if (PHP_SAPI !== 'cli'
     // WordPress's page-load cron spawner self-requests the public wp-cron.php, which the runtime
     // blocks (DISABLE_PUBLIC_WP_CRON); the internal trigger loop runs cron instead. Follow it unless
     // WP_DISABLE_WP_CRON says otherwise.
-    $disableCron = $env('WP_DISABLE_WP_CRON');
-    $define('DISABLE_WP_CRON', $disableCron === null
-        ? !$falsy($env('WP_CRON_TRIGGER_ENABLED', 'true'))
-        : $truthy($disableCron));
+    $define('DISABLE_WP_CRON', $flag('WP_DISABLE_WP_CRON', $flag('WP_CRON_TRIGGER_ENABLED', true)));
 
     // The theme/plugin file editors turn any admin session into code execution on a writable
     // docroot. Off by default like every managed WordPress host; WP_DISALLOW_FILE_EDIT=false re-enables.
-    $define('DISALLOW_FILE_EDIT', !$falsy($env('WP_DISALLOW_FILE_EDIT', 'true')));
+    $define('DISALLOW_FILE_EDIT', $flag('WP_DISALLOW_FILE_EDIT', true));
 
     // WordPress raises memory_limit to WP_MEMORY_LIMIT whenever that is higher, which would defeat
     // the per-request cap the runtime sized to the container (zz-custom.ini: 128M below 1.5G of
@@ -160,7 +164,7 @@ if (PHP_SAPI !== 'cli'
     ];
 
     $plugin = '/usr/share/wp-runtime/mu-plugins/code-capsules.php';
-    if (!$falsy($env('WP_RUNTIME_MU_PLUGIN_ENABLED', 'true')) && is_file($plugin)) {
+    if ($flag('WP_RUNTIME_MU_PLUGIN_ENABLED', true) && is_file($plugin)) {
         // Shape expected by WP_Hook::build_preinitialized_hooks(): [hook][priority][] = callback.
         $GLOBALS['wp_filter']['muplugins_loaded'][-100][] = [
             'function'      => static function () use ($plugin): void {
