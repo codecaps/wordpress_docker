@@ -75,7 +75,7 @@ Prometheus exporters. Everything is tunable through environment variables.
 ## Tracks and tags
 
 Tracks: `php8.3`, `php8.4` (default for new capsules), `php8.5`. Each track's `REVISION` moves on
-its own (currently `php8.3-r4`, `php8.4-r5`, `php8.5-r4`).
+its own (currently `php8.3-r5`, `php8.4-r6`, `php8.5-r5`).
 
 Images go to `europe-west4-docker.pkg.dev/appstrax/main/wordpress-runtime`:
 
