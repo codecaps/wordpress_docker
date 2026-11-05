@@ -457,17 +457,52 @@ docker rm -f "$N-pinned" >/dev/null
 # the site comes up. Before, a /33 CIDR or an oversized size passed validation and failed nginx -t, and
 # a rejected value was no better: the validator's log line ended up inside the fallback value, so
 # the generated config failed nginx -t either way and the pod crash-looped.
+# The same container carries misspelt on/off switches and timeouts, checked below.
 run_wp "$N-badenv" "" "$IMG" -e WP_CRON_TRIGGER_ENABLED=false -e TRUSTED_PROXY_CIDRS=10.0.0.0/8,10.0.0.0/33 \
     -e MAX_UPLOAD_SIZE=99999999999G -e CACHE_MAX_SIZE=99999999999G -e RATE_LIMIT_MAX_CONN_PER_IP=70000 \
-    -e NGINX_WORKER_PROCESSES=99999 -e 'CSP_HEADER=default-src "self"'
+    -e NGINX_WORKER_PROCESSES=99999 -e 'CSP_HEADER=default-src "self"' \
+    -e DISABLE_PUBLIC_WP_CRON=ture -e XMLRPC_ENABLED=yess -e DEBUG_HEADERS=tru -e CACHE_SKIP_EMPTY=nope \
+    -e WP_DISALLOW_FILE_EDIT=flase -e SHUTDOWN_TIMEOUT_SECONDS=20s -e FPM_STARTUP_TIMEOUT_SECONDS=10m
 code="$(wait_http "$N-badenv" /healthz 150)"
 blogs="$(docker logs "$N-badenv" 2>&1)"
-n_invalid="$(grep -c '^\[nginx-overrides\] Invalid' <<<"$blogs")"
+n_invalid="$(grep '^\[nginx-overrides\] Invalid' <<<"$blogs" | grep -vc 'yes/no or on/off')"
 up="$(docker exec "$N-badenv" php -r 'echo ini_get("upload_max_filesize");' 2>&1)"
 if [ "$code" = 200 ] && [ "$n_invalid" = 6 ] && [ "$up" = 64M ] && ! grep -q 'test failed' <<<"$blogs"; then
     pass env-fallback
 else
     fail env-fallback "healthz=${code} invalid-lines=${n_invalid} upload_max_filesize='${up}' $(grep -m1 'emerg' <<<"$blogs")"
+fi
+
+# switch-fallback: a misspelt on/off switch falls back to its default, with a log line. It used to
+# count silently as the other state: DISABLE_PUBLIC_WP_CRON=ture made wp-cron.php public.
+n_switch="$(grep -c "^\[nginx-overrides\] Invalid .* yes/no or on/off). Falling back to" <<<"$blogs")"
+bport="$(port_of "$N-badenv")"
+cron_code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${bport}/wp-cron.php")"
+xmlrpc_code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${bport}/xmlrpc.php")"
+edit="$(docker exec "$N-badenv" php -r 'require "/usr/share/wp-runtime/prepend.php"; echo DISALLOW_FILE_EDIT ? "noedit" : "edit";' 2>&1)"
+# This container's WP_CRON_TRIGGER_ENABLED=false is a real off value: the metric must say 0, or an
+# alert on wp_cron_trigger_enabled == 1 would fire for every capsule that turned the trigger off.
+off_metric="$(docker exec "$N-badenv" curl -s 127.0.0.1:8080/wp-metrics | sed -n 's/^wp_cron_trigger_enabled //p')"
+if [ "$n_switch" = 4 ] && [ "$cron_code" = 403 ] && [ "$xmlrpc_code" = 403 ] && [ "$edit" = noedit ] \
+        && [ "$off_metric" = 0 ] && grep -q "^\[custom-ini\] Invalid WP_DISALLOW_FILE_EDIT value 'flase'" <<<"$blogs"; then
+    pass switch-fallback
+else
+    fail switch-fallback "switch-lines=${n_switch} wp-cron=${cron_code} xmlrpc=${xmlrpc_code} file-edit=${edit} wp_cron_trigger_enabled=${off_metric:-none}"
+fi
+
+# timeout-fallback: a timeout that is not a whole number falls back to its default. 20s used to
+# break the arithmetic in the TERM handler, so run.sh died without waiting for in-flight requests.
+start=$(date +%s)
+docker stop -t 30 "$N-badenv" >/dev/null
+took=$(( $(date +%s) - start ))
+exit_code="$(docker inspect -f '{{.State.ExitCode}}' "$N-badenv")"
+blogs="$(docker logs "$N-badenv" 2>&1)"
+if [ "$exit_code" = 0 ] && [ "$took" -lt 10 ] && grep -q '\[run\] Shutting down (exit 0)' <<<"$blogs" \
+        && grep -q "^\[run\] Invalid SHUTDOWN_TIMEOUT_SECONDS value '20s'" <<<"$blogs" \
+        && grep -q "^\[run\] Invalid FPM_STARTUP_TIMEOUT_SECONDS value '10m'" <<<"$blogs"; then
+    pass timeout-fallback
+else
+    fail timeout-fallback "took ${took}s, exit ${exit_code}; $(grep '^\[run\] Invalid' <<<"$blogs" | tr '\n' ' ')"
 fi
 docker rm -f "$N-badenv" >/dev/null
 
@@ -531,7 +566,9 @@ run_wp "$N-wp2" "$N-vol" "$IMG"
 wait_http "$N-wp2" /healthz >/dev/null
 docker exec "$N-wp2" sed -i "s/^\$wp_version = .*/\$wp_version = '6.5.5';/" /var/www/html/wp-includes/version.php
 docker rm -f "$N-wp2" >/dev/null
-run_wp "$N-wp3" "$N-vol" "$IMG" -e WP_CRON_TRIGGER_INTERVAL_SECONDS=2 -e WP_CRON_TRIGGER_TARGETS_REFRESH_SECONDS=3
+# WP_CRON_TRIGGER_ENABLED is misspelt on purpose: it falls back to on (cron-switch-fallback below).
+run_wp "$N-wp3" "$N-vol" "$IMG" -e WP_CRON_TRIGGER_INTERVAL_SECONDS=2 -e WP_CRON_TRIGGER_TARGETS_REFRESH_SECONDS=3 \
+    -e WP_CRON_TRIGGER_ENABLED=enabled
 wait_http "$N-wp3" /healthz >/dev/null
 marker="$(docker exec "$N-wp3" grep '^\$wp_version' /var/www/html/wp-includes/version.php)"
 if [ "$marker" = "\$wp_version = '6.5.5';" ]; then
@@ -545,6 +582,8 @@ fi
 # A plugin that ends plain-HTTP requests early (as HTTPS-forcing plugins do) stops cron while the
 # site URL is http: every trigger request still gets its 200, but the heartbeat must stay empty.
 # Once the site URL is https the trigger sends X-Forwarded-Proto: https and the event runs.
+# This container's WP_CRON_TRIGGER_ENABLED is misspelt on purpose: if this check fails together with
+# cron-switch-fallback, look at the switch's fallback first.
 port3="$(port_of "$N-wp3")"
 docker exec -i "$N-wp3" bash -c 'mkdir -p /var/www/html/wp-content/mu-plugins && cat > /var/www/html/wp-content/mu-plugins/cc-smoke-cron.php' <<'EOP'
 <?php
@@ -578,6 +617,20 @@ if [ -z "$hb_http" ] && [ "$ran_http" = 0 ] && [ "$answered" -ge 2 ] && [ "$ran"
     pass cron-honest-https
 else
     fail cron-honest-https "http: heartbeat='${hb_http}' ran=${ran_http} answered-200=${answered}; https: ran=${ran} heartbeat='${hb_https}' metric=${metric:-none}"
+fi
+
+# cron-switch-fallback: the misspelt WP_CRON_TRIGGER_ENABLED=enabled above is logged and counts as
+# on everywhere: the trigger runs (cron-honest-https), WordPress's spawner stays off, and the
+# metrics say enabled. It used to stop the trigger with the spawner still off: no cron at all.
+w3logs="$(docker logs "$N-wp3" 2>&1)"
+spawner="$(wp_cli "$N-wp3" eval 'echo DISABLE_WP_CRON ? "cron-off" : "cron-on";' 2>/dev/null)"
+enabled_metric="$(docker exec "$N-wp3" curl -s 127.0.0.1:8080/wp-metrics | sed -n 's/^wp_cron_trigger_enabled //p')"
+if grep -q "^\[run\] Invalid WP_CRON_TRIGGER_ENABLED value 'enabled'" <<<"$w3logs" \
+        && grep -q '^\[wp-cron-trigger\] internal trigger loop starting' <<<"$w3logs" \
+        && [ "$spawner" = cron-off ] && [ "$enabled_metric" = 1 ]; then
+    pass cron-switch-fallback
+else
+    fail cron-switch-fallback "spawner=${spawner} wp_cron_trigger_enabled=${enabled_metric:-none} $(grep -m1 'WP_CRON_TRIGGER_ENABLED' <<<"$w3logs")"
 fi
 
 # healthz: 200 while FPM is up; non-200 (or the container exits non-zero) once FPM dies.

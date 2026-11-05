@@ -98,8 +98,10 @@ _sizing_positive_int_or_default() {
         echo "$default"
         return
     fi
+    # 10#: with a leading zero bash arithmetic reads the value as octal, and 08 or 09 aborts the
+    # sizing (and the container start) under set -e.
     if [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -ge 1 ]; then
-        echo "$value"
+        echo "$(( 10#$value ))"
         return
     fi
     _sizing_log "Invalid ${name} value '${value}'. Falling back to ${default}." >&2
@@ -317,6 +319,8 @@ resource_sizing_load() {
     pinned_children="$(resource_sizing_override_value pm.max_children "${WORDPRESS_FPM_CONF:-}")"
     if [ -n "$pinned_children" ]; then
         if [[ "$pinned_children" =~ ^[0-9]+$ ]] && [ "$pinned_children" -ge 1 ]; then
+            # PHP-FPM reads "08" as 8; bash arithmetic would read it as octal and fail.
+            pinned_children=$(( 10#$pinned_children ))
             read -r CC_SIZING_FPM_START_SERVERS CC_SIZING_FPM_MIN_SPARE CC_SIZING_FPM_MAX_SPARE \
                 < <(resource_sizing_spares "$pinned_children")
             export CC_SIZING_FPM_MAX_CHILDREN="$pinned_children"
