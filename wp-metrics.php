@@ -16,10 +16,9 @@ global $wpdb, $wp_version;
 // looks identical for a capsule that has turned it off as it does for one
 // where the loop actually died — any alert on the timestamp needs to be
 // conditioned on wp_cron_trigger_enabled==1 to avoid firing fleet-wide.
-// Unset means enabled, matching the default in run.sh.
-$wp_cron_trigger_enabled_raw = getenv('WP_CRON_TRIGGER_ENABLED');
-$wp_cron_trigger_enabled_raw = $wp_cron_trigger_enabled_raw === false ? 'true' : (string) $wp_cron_trigger_enabled_raw;
-$wp_cron_trigger_enabled     = in_array(strtolower(trim($wp_cron_trigger_enabled_raw)), ['1', 'true', 'on', 'yes'], true) ? 1 : 0;
+// Only an explicit off value turns it off: unset, empty or a typo means enabled, as in run.sh
+// (validated_bool() in scripts/lib/runtime_env.sh), where a typo falls back to on.
+$wp_cron_trigger_enabled = in_array(strtolower(trim((string) getenv('WP_CRON_TRIGGER_ENABLED'))), ['0', 'false', 'no', 'off'], true) ? 0 : 1;
 
 $wp_cron_trigger_heartbeat_file  = '/var/run/wp-runtime/cron-last-run';
 $wp_cron_trigger_last_success    = is_readable($wp_cron_trigger_heartbeat_file)

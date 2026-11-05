@@ -15,6 +15,11 @@ assert_eq 7 "$(validated_positive_int 3.5 7 X)" "decimal"
 assert_eq 7 "$(validated_positive_int "" 7 X)" "empty"
 assert_eq 7 "$(validated_positive_int 99999999999 7 X)" "beyond nine digits"
 assert_eq 7 "$(validated_positive_int 99999999999999999999 7 X)" "beyond bash integers"
+assert_eq 8 "$(validated_positive_int 08 7 X)" "leading zero: decimal 8 (bash arithmetic fails on octal 08)"
+assert_eq 10 "$(validated_positive_int 010 7 X)" "leading zero: decimal 10, not octal 8"
+assert_eq 7 "$(validated_positive_int 000 7 X)" "zeros only"
+# In a subshell: an arithmetic error would otherwise abort this command before the assertion runs.
+assert_eq 13 "$(echo "$(( $(validated_positive_int 09 7 X) + 4 ))" 2>/dev/null)" "the result is safe in bash arithmetic"
 assert_eq 65535 "$(validated_positive_int 65535 100 X 65535)" "at the bound"
 assert_eq 100 "$(validated_positive_int 70000 100 X 65535)" "above the bound (nginx limit_conn refuses 65536+)"
 out="$(log() { echo "$*"; }; validated_positive_int 70000 100 RATE_LIMIT_MAX_CONN_PER_IP 65535 2>&1)"
@@ -28,6 +33,20 @@ assert_eq 100G "$(validated_upload_size 100G 1M X)" "largest value"
 for bad in 1023K 0M 101G 102401M 99999999999G 64MB 64 -1 "" 1.5G; do
     assert_eq 1M "$(validated_upload_size "$bad" 1M X)" "rejects '$bad'"
 done
+
+echo "validated_bool: true/1/yes/on or false/0/no/off in any case, else the fallback"
+for on in true 1 yes on TRUE Yes ON " true " $'on\t' $'\vtrue\r\n'; do
+    assert_eq true "$(validated_bool "$on" false X)" "on: '$on'"
+done
+for off in false 0 no off FALSE No OFF " off"; do
+    assert_eq false "$(validated_bool "$off" true X)" "off: '$off'"
+done
+# A form feed is not whitespace to PHP's trim(), so the prepend would not accept it either.
+for bad in ture flase enabled disabled 2 y n "" "tr ue" "true false" $'false\f'; do
+    assert_eq D "$(validated_bool "$bad" D X)" "rejects '$bad'"
+done
+out="$(log() { echo "$*"; }; validated_bool ture true DISABLE_PUBLIC_WP_CRON 2>&1)"
+assert_eq "Invalid DISABLE_PUBLIC_WP_CRON value 'ture' (true/false, 1/0, yes/no or on/off). Falling back to true."$'\n'"true" "$out" "the value and the fallback are named in the log"
 
 echo "valid_cidr: only what nginx's set_real_ip_from accepts"
 for good in 10.0.0.0/8 172.16.0.0/12 192.168.1.1 0.0.0.0/0 255.255.255.254/32 \
@@ -49,6 +68,7 @@ noisy() { log() { echo "[test] $*"; }; "$@" 2>/dev/null; }
 assert_eq 100 "$(noisy validated_positive_int 70000 100 X 65535)" "positive int"
 assert_eq 64M "$(noisy validated_upload_size 99999999999G 64M X)" "upload size"
 assert_eq "D1 D2" "$(noisy validated_cidrs "10.0.0.0/33" "D1 D2" X)" "CIDR list"
+assert_eq true "$(noisy validated_bool ture true X)" "on/off switch"
 assert_contains "$(log() { echo "[test] $*"; }; validated_upload_size 0M 64M MAX_UPLOAD_SIZE 2>&1 >/dev/null)" "Invalid MAX_UPLOAD_SIZE" "and the log line still reaches stderr"
 
 echo "validated_cidrs: one bad entry falls back to the whole default list"

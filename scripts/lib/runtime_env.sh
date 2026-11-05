@@ -5,27 +5,34 @@
 # "[nginx-overrides] Invalid ..." into the generated config, which nginx refused, so no fallback ever
 # worked). The cgroup-aware sizing lives in resource_sizing.sh.
 
-is_true() {
-    case "${1,,}" in
-        true|1|yes|on) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-is_false() {
-    case "${1,,}" in
-        false|0|no|off) return 0 ;;
-        *) return 1 ;;
+# An on/off switch as "true" or "false": true/1/yes/on or false/0/no/off in any case, surrounding
+# whitespace ignored. Anything else is the fallback (logged): a typo used to count silently as the
+# other state, so DISABLE_PUBLIC_WP_CRON=ture made wp-cron.php public. runtime/prepend.php and
+# wp-metrics.php read some switches themselves and must apply the same rule.
+validated_bool() {
+    local value="$1" fallback="$2" var_name="$3" word=""
+    # The whitespace PHP's trim() strips (bar NUL, which an environment value cannot hold).
+    local ws=$' \t\n\r\v'
+    [[ "$value" =~ ^[$ws]*([^$ws]*)[$ws]*$ ]] && word="${BASH_REMATCH[1],,}"
+    case "$word" in
+        true|1|yes|on) echo true ;;
+        false|0|no|off) echo false ;;
+        *)
+            log "Invalid ${var_name} value '${value}' (true/false, 1/0, yes/no or on/off). Falling back to ${fallback}." >&2
+            echo "$fallback"
+            ;;
     esac
 }
 
 # Positive integer (at most MAX, default 999999999) or the fallback (logged). The bound keeps the
 # value inside what bash and nginx can represent: a value nginx rejects would fail `nginx -t`, and
 # run.sh can only recover from a broken NGINX_EXTRA_CONF, so the pod would crash-loop instead.
+# Leading zeros are dropped: bash arithmetic reads 010 as octal 8 and fails on 08 or 09, which
+# would break run.sh's shutdown wait or stop the cron loop for good.
 validated_positive_int() {
     local value="$1" fallback="$2" var_name="$3" max="${4:-999999999}"
     if [[ "$value" =~ ^[0-9]{1,9}$ ]] && [ "$value" -ge 1 ] && [ "$value" -le "$max" ]; then
-        echo "$value"
+        echo "$(( 10#$value ))"
         return
     fi
     log "Invalid ${var_name} value '${value}' (a whole number from 1 to ${max}). Falling back to ${fallback}." >&2
